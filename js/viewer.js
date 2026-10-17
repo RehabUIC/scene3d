@@ -3,7 +3,7 @@
 // master sends — so the picture is always full resolution and lag-free.
 
 import * as THREE from 'three';
-import { CONFIG, PARAMS } from './config.js';
+import { CONFIG, PARAMS, ROOM } from './config.js';
 import { ViewerLink } from './link.js';
 import * as C from './common.js';
 
@@ -170,13 +170,18 @@ link.start();
 const overlay = $('#overlay'), msg = $('#msg'), sub = $('#sub'), bar = $('#bar'), barFill = $('#barFill');
 
 function updateOverlay() {
-  $('#hudStatus').textContent = link.status;
+  $('#hudStatus').textContent = `${link.status} · room ${ROOM}`;
   $('#hudDot').className = 'dot ' + (link.connected ? 'online' : 'connecting');
 
   let big = '', small = '', progress = null;
   if (!link.connected) {
     big = 'Waiting for the master';
-    small = link.status;
+    const hint = {
+      'no-master': `No master is open in room “${ROOM}”. Open the master page, and if it shows a different room name, use the link from its “Copy all links” button.`,
+      'no-server': 'This device cannot reach the internet signalling server.',
+      blocked: 'The master was found, but this network blocks the direct link between the two devices (typical on mobile data or guest Wi-Fi). Try the same Wi-Fi as the master, or set up the free TURN relay (README → “Phones / mobile data”).',
+    }[link.problem];
+    small = hint || link.status;
   } else if (!state) {
     big = 'Connected'; small = 'Receiving the scene…';
   } else if (!myCamId) {

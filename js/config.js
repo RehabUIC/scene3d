@@ -14,6 +14,18 @@ export const CONFIG = {
   // Can also be overridden per page with ?room=something
   defaultRoom: null,
 
+  // ---- Phones on mobile data / strict networks ----------------------------
+  // Browsers normally connect directly. Mobile networks (and some campus
+  // Wi-Fi) often block that, and then a TURN relay server is needed.
+  // Easiest free option: sign up at https://www.metered.ca/tools/openrelay/
+  // (20 GB/month free — far more than this app uses) and paste your
+  // credentials URL here, e.g.
+  //   turnCredentialsUrl: 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=YOUR_KEY',
+  turnCredentialsUrl: '',
+  // …or list ICE servers yourself (used in addition to the defaults):
+  //   iceServers: [{ urls: 'turn:my.turn.server:3478', username: 'u', credential: 'p' }],
+  iceServers: [],
+
   // Output aspect ratio of every screen.
   aspect: 16 / 9,
 
@@ -34,11 +46,42 @@ function slug(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'scene';
 }
 
-export const DEFAULT_ROOM = slug(CONFIG.defaultRoom || (location.hostname + BASE));
+// On GitHub Pages the room comes from the site address (unique to you).
+// Elsewhere (a test server on your laptop) the hostname differs between the
+// laptop ("localhost") and a phone ("192.168.x.x"), so leave it out there.
+const ON_GITHUB = location.hostname.endsWith('github.io');
+export const DEFAULT_ROOM = slug(CONFIG.defaultRoom ||
+  (ON_GITHUB ? location.hostname + BASE : 'local-' + (location.port || '80') + BASE));
 export const ROOM = slug(params.get('room') || DEFAULT_ROOM);
 
-export function peerOptions() {
+const DEFAULT_ICE = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+];
+let icePromise = null;
+function getIceServers() {
+  if (!icePromise) {
+    icePromise = (async () => {
+      let extra = [...(CONFIG.iceServers || [])];
+      const url = params.get('turn') || CONFIG.turnCredentialsUrl;
+      if (url) {
+        try {
+          const r = await fetch(url);
+          const list = await r.json();
+          if (Array.isArray(list)) extra = extra.concat(list);
+        } catch (e) { console.warn('TURN credentials could not be fetched', e); }
+      }
+      return { servers: [...extra, ...DEFAULT_ICE], hasOwnTurn: extra.some((s) => String(s.urls).includes('turn')) };
+    })();
+  }
+  return icePromise;
+}
+export async function hasOwnTurn() { return (await getIceServers()).hasOwnTurn; }
+
+export async function peerOptions() {
   const o = { ...CONFIG.peer };
+  o.config = { iceServers: (await getIceServers()).servers };
   if (params.get('peerhost')) o.host = params.get('peerhost');
   if (params.get('peerport')) o.port = +params.get('peerport');
   if (params.get('peerpath')) o.path = params.get('peerpath');
@@ -64,7 +107,7 @@ function carriedQuery(extra = {}) {
 
 // Pretty links (site/3) rely on GitHub Pages serving 404.html for unknown
 // paths. Anywhere else (e.g. a local test server) use view.html?screen=3.
-export const PRETTY_LINKS = location.hostname.endsWith('github.io') || params.get('pretty') === '1';
+export const PRETTY_LINKS = ON_GITHUB || params.get('pretty') === '1';
 
 export function screenUrl(n) {
   if (PRETTY_LINKS) return location.origin + BASE + n + carriedQuery();

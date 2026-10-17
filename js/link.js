@@ -8,7 +8,7 @@
 //             A free public signalling server introduces the browsers, then
 //             data flows directly between them.
 
-import { ROOM, BASE, peerOptions, LOCAL_ONLY, NET_ONLY } from './config.js';
+import { ROOM, BASE, peerOptions, hasOwnTurn, LOCAL_ONLY, NET_ONLY } from './config.js';
 
 const MASTER_PEER_ID = `s3d-${ROOM}-master`;
 const CHANNEL_NAME = `s3d:${ROOM}`;
@@ -83,9 +83,11 @@ export class MasterHub {
     try { Peer = await loadPeerJS(); }
     catch (e) { this._setNet('error', 'PeerJS library failed to load'); return; }
 
+    const opts = await peerOptions();
+    this.hasTurn = await hasOwnTurn();
     const open = () => {
       this._setNet('connecting');
-      const peer = (this.peer = new Peer(MASTER_PEER_ID, peerOptions()));
+      const peer = (this.peer = new Peer(MASTER_PEER_ID, opts));
       peer.on('open', () => this._setNet('online'));
       peer.on('connection', (conn) => this._acceptConn(conn));
       peer.on('disconnected', () => {
@@ -256,19 +258,22 @@ export class ViewerLink {
     catch { this._set(false, null, 'Could not load the networking library'); this._retry(); return; }
 
     this._set(false, null, 'Connecting over the internet…');
+    const opts = await peerOptions();
     if (!this.peer || this.peer.destroyed) {
       await new Promise((resolve) => {
-        const peer = (this.peer = new Peer(undefined, peerOptions()));
+        const peer = (this.peer = new Peer(undefined, opts));
         let done = false;
         const finish = () => { if (!done) { done = true; resolve(); } };
         peer.on('open', finish);
         peer.on('error', (err) => {
           const type = err && err.type;
           if (type === 'peer-unavailable') {
-            this._set(false, null, 'Waiting for the master page to open…');
+            this.problem = 'no-master';
+            this._set(false, null, `No master found in room “${ROOM}”. Is the master page open (with the same room)?`);
             this._retry();
           } else if (['network', 'server-error', 'socket-error', 'socket-closed', 'unavailable-id'].includes(type)) {
-            this._set(false, null, 'Signalling server unreachable, retrying…');
+            this.problem = 'no-server';
+            this._set(false, null, 'Cannot reach the signalling server (check this device’s internet). Retrying…');
             peer.destroy();
             this._retry();
           } else {
@@ -284,10 +289,12 @@ export class ViewerLink {
 
     const conn = this.peer.connect(MASTER_PEER_ID, { reliable: true });
     this.net = conn;
+    this._set(false, null, `Looking for the master in room ${ROOM}…`);
     conn.on('open', () => {
       if (this.net !== conn) return;
       if (this.mode === 'local') { conn.close(); return; }
       this.lastHeard = performance.now();
+      this.problem = null;
       this._set(true, 'net', 'Connected over the internet');
       conn.send({ t: 'join', screen: this.screen, info: navigator.userAgent });
     });
@@ -300,7 +307,10 @@ export class ViewerLink {
     conn.on('close', () => { if (this.net === conn) this._lost('Connection closed'); });
     conn.on('error', () => { if (this.net === conn) this._lost('Connection error'); });
     setTimeout(() => {
-      if (this.net === conn && !this.connected) this._lost('Could not reach the master');
+      if (this.net === conn && !this.connected) {
+        this.problem = 'blocked';
+        this._lost('Found the master, but this network blocked the direct link (common on mobile data) — a TURN relay is needed, see README');
+      }
     }, 15000);
   }
 

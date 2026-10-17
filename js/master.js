@@ -754,7 +754,8 @@ function renderPanel() {
   st.innerHTML = `
     <div class="st-row"><span class="dot ${net}"></span><span>Internet</span><span class="st-val">${esc(netLabel)}</span></div>
     <div class="st-row"><span class="dot online"></span><span>This computer</span><span class="st-val">Ready (other tabs/windows)</span></div>
-    <div class="st-row"><span class="dot none"></span><span>Room</span><span class="st-val mono">${esc(ROOM)}</span></div>`;
+    <div class="st-row"><span class="dot none"></span><span>Room</span><span class="st-val mono">${esc(ROOM)}</span></div>
+    ${LOCAL_ONLY ? '' : `<div class="st-row" title="Needed for phones on mobile data or strict networks — see README"><span class="dot ${hub.hasTurn ? 'online' : 'none'}"></span><span>Mobile relay</span><span class="st-val">${hub.hasTurn ? 'TURN relay set up' : 'Not set up (mobile data may fail)'}</span></div>`}`;
   $('#chip').innerHTML = `<span class="dot ${net}"></span>${hub.viewers.size} screen${hub.viewers.size === 1 ? '' : 's'} connected`;
 
   // ---- cameras / screens

@@ -62,6 +62,18 @@ They show up as one-click buttons on the master. You can also type any web addre
 | `?model=models/x.glb` (master) | Load a model on start. |
 | `?scene=models/myscene.json` (master) | Start from a saved scene file. |
 
+## Phones / mobile data
+
+A screen page always tells you what is wrong. Read the message under "Waiting for the master":
+
+- **"No master is open in room …"**: the master isn't open, or it uses a different room. Compare the room name on the screen (bottom-left) with the one in the master's panel.
+- **"…this network blocks the direct link…"**: the two devices found each other, but the network refuses a direct connection. This is typical on mobile data, hotspots and guest or campus Wi-Fi. Fix it with a free TURN relay:
+  1. Sign up at https://www.metered.ca/tools/openrelay/ (free, 20 GB/month).
+  2. In their dashboard, copy your TURN credentials URL. It looks like `https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=…`.
+  3. Paste it into `turnCredentialsUrl` in `js/config.js` and commit. The master panel's "Mobile relay" line turns green.
+
+**Testing from a phone against a server on your laptop:** `localhost` on the phone means the phone itself. Open `http://<your-laptop-IP>:8000/view.html?screen=1` instead (find the IP with `ipconfig` on Windows or `ipconfig getifaddr en0` on a Mac), with both devices on the same Wi-Fi. Allow Python through the firewall if Windows asks.
+
 ## Limits worth knowing
 
 - The master page must stay open. If it closes, screens freeze and reconnect automatically when it comes back.
