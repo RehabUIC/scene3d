@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scene3D · Screen</title>
+<!--
+  Screen page. Reached as  site/3  (via 404.html on GitHub Pages)
+  or as                    site/view.html?screen=3  (works on any web server).
+  view.html and 404.html are identical — keep them in sync if you edit one.
+-->
+<script>
+  (function () {
+    var segs = location.pathname.split('/');
+    if (segs[segs.length - 1] === '') segs.pop();
+    var last = segs[segs.length - 1] || '';
+    var screen = null;
+    if (/^\d+$/.test(last)) { screen = +last; segs.pop(); }
+    else if (/\.html?$/i.test(last)) segs.pop();
+    else { window.S3D = { notFound: true }; return; }
+    var base = segs.join('/') + '/';
+    window.S3D = { base: base, screen: screen };
+    var im = document.createElement('script');
+    im.type = 'importmap';
+    im.textContent = JSON.stringify({ imports: { three: base + 'lib/three/three.module.js', 'three/addons/': base + 'lib/three/addons/' } });
+    document.currentScript.after(im);
+    var css = document.createElement('link');
+    css.rel = 'stylesheet'; css.href = base + 'css/viewer.css';
+    document.head.appendChild(css);
+  })();
+</script>
+<script type="module">
+  if (window.S3D.notFound) {
+    document.body.innerHTML = '<p style="font:15px system-ui;color:#ccc;padding:24px">Page not found. Screen pages look like <b>…/1</b>, <b>…/2</b>.</p>';
+  } else {
+    import(window.S3D.base + 'js/viewer.js');
+  }
+</script>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="overlay" class="solid">
+  <div class="ov-inner">
+    <div class="ov-num"><span id="screenNo"></span></div>
+    <div id="msg">Starting…</div>
+    <div id="sub"></div>
+    <div id="bar" hidden><div id="barFill"></div></div>
+  </div>
+</div>
+
+<div id="hud">
+  <span id="hudDot" class="dot connecting"></span>
+  <span id="hudStatus">Starting…</span>
+  <button id="fsBtn" title="Fullscreen (F or double-click)">⛶</button>
+</div>
+<div id="flash" hidden></div>
+</body>
+</html>

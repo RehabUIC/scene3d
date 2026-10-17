@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scene3D · Master</title>
+<script>
+  // Works out where the site lives (e.g. /scene3d/) so every path below is right.
+  (function () {
+    var segs = location.pathname.split('/');
+    if (segs[segs.length - 1] === '') segs.pop();
+    if (/\.html?$/i.test(segs[segs.length - 1] || '')) segs.pop();
+    var base = segs.join('/') + '/';
+    window.S3D = { base: base, screen: null };
+    var im = document.createElement('script');
+    im.type = 'importmap';
+    im.textContent = JSON.stringify({ imports: { three: base + 'lib/three/three.module.js', 'three/addons/': base + 'lib/three/addons/' } });
+    document.currentScript.after(im);
+    var css = document.createElement('link');
+    css.rel = 'stylesheet'; css.href = base + 'css/master.css';
+    document.head.appendChild(css);
+  })();
+</script>
+<script type="module">import(window.S3D.base + 'js/master.js');</script>
+</head>
+<body>
+<div id="app">
+  <main id="stage">
+    <canvas id="c"></canvas>
+    <div id="pilotFrame" hidden></div>
+
+    <div id="toolbar">
+      <div class="seg">
+        <button data-mode="translate" title="Move (W)">Move</button>
+        <button data-mode="rotate" title="Rotate (E)">Rotate</button>
+        <button data-mode="scale" title="Scale (R) — models only">Scale</button>
+      </div>
+      <button class="tb" id="addCam" title="Add a camera where you are looking now (C)">+ Camera</button>
+      <button class="tb" id="focus" title="Center the view on the selection (F)">Focus</button>
+    </div>
+    <div id="chip"></div>
+
+    <div id="pilotBanner" hidden>
+      Looking through <b id="pilotName"></b> — drag to aim, right-drag to slide, scroll to move
+      <button id="exitPilot">Done (Esc)</button>
+    </div>
+
+    <div id="previews" hidden></div>
+    <div id="dropHint" hidden><div>Drop to import<small>.glb .gltf .fbx .obj .stl .ply — folders and texture files too</small></div></div>
+  </main>
+
+  <aside id="panel">
+    <header class="brand">
+      <div class="logo"><span></span><span></span><span></span></div>
+      <div class="brand-text"><b>Scene3D</b><small>master</small></div>
+      <button class="ib help" id="helpBtn" title="How it works">?</button>
+    </header>
+
+    <section id="status" class="status"></section>
+
+    <section>
+      <h3>Cameras <span class="sub">→ screens</span><button class="btn small right" id="copyLinks">Copy all links</button></h3>
+      <div id="camList" class="list"></div>
+      <div id="orphans"></div>
+      <button class="btn wide ghost" id="addCam2">+ Add camera from current view</button>
+    </section>
+
+    <section>
+      <h3>Selected</h3>
+      <div id="props"></div>
+    </section>
+
+    <section>
+      <h3>Models</h3>
+      <div id="objList" class="list"></div>
+      <div class="btns">
+        <button class="btn" id="importBtn">Import file…</button>
+        <input type="file" id="fileInput" multiple hidden accept=".glb,.gltf,.fbx,.obj,.mtl,.stl,.ply,.bin,.png,.jpg,.jpeg,.webp,.ktx2,.tga">
+      </div>
+      <form id="urlForm" class="urlform">
+        <input id="urlInput" placeholder="models/robot.glb or https://…/model.glb" autocomplete="off">
+        <button class="btn">Add</button>
+      </form>
+      <div id="siteModels" hidden>
+        <div class="minor">In this site’s models/ folder</div>
+        <div id="siteModelList" class="chips"></div>
+      </div>
+    </section>
+
+    <section>
+      <h3>World</h3>
+      <label class="field"><span>Background</span><input type="color" id="wBg" value="#15171c"></label>
+      <label class="field"><span>Light</span><input type="range" id="wLight" min="0.2" max="2" step="0.05" value="1"></label>
+      <label class="check"><input type="checkbox" id="wFloor" checked> Floor shadows</label>
+      <label class="check"><input type="checkbox" id="wGrid"> Show grid on screens</label>
+    </section>
+
+    <section>
+      <h3>Scene</h3>
+      <div class="btns">
+        <button class="btn" id="saveScene">Save scene file</button>
+        <button class="btn" id="openScene">Open…</button>
+        <button class="btn ghost" id="resetScene">Reset</button>
+        <input type="file" id="sceneInput" hidden accept=".json,application/json">
+      </div>
+      <div class="minor">Everything is also kept automatically in this browser.</div>
+    </section>
+  </aside>
+</div>
+
+<div id="help" hidden>
+  <div class="help-card">
+    <button class="ib close" data-close>×</button>
+    <h2>How Scene3D works</h2>
+    <p>This page is the <b>master</b>. It holds the 3D scene. Every camera you add here is a <b>screen</b>: open its link on any browser and it shows exactly what that camera sees, in 16:9.</p>
+    <ul>
+      <li><b>Same computer</b> (other tabs or windows of this browser): connects instantly, no internet needed.</li>
+      <li><b>Other computers</b>: connect over the internet through the room name shown in the panel.</li>
+      <li>Screens draw the scene themselves; the master only sends positions, so they stay sharp and smooth.</li>
+    </ul>
+    <h3>Mouse</h3>
+    <p>Left-drag orbit · right-drag pan · scroll zoom · click to select · double-click a preview to look through it.</p>
+    <h3>Keys</h3>
+    <div class="keys">
+      <span><kbd>W</kbd> move</span><span><kbd>E</kbd> rotate</span><span><kbd>R</kbd> scale</span>
+      <span><kbd>C</kbd> add camera</span><span><kbd>F</kbd> focus</span><span><kbd>1</kbd>–<kbd>9</kbd> look through camera</span>
+      <span><kbd>Esc</kbd> stop / deselect</span><span><kbd>Del</kbd> delete selected</span>
+    </div>
+    <h3>On a screen page</h3>
+    <p>Double-click or press <kbd>F</kbd> for fullscreen. Add <code>?fit=window</code> to fill a non-16:9 display.</p>
+  </div>
+</div>
+
+<div id="toasts"></div>
+</body>
+</html>
