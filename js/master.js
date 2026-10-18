@@ -542,19 +542,23 @@ function sendAssets(v) {
 }
 
 hub.onJoin = (v) => {
-  v.sent = new Set();
+  v.sent = new Set(v.have || []);
   v.send({ t: 'state', state: serialize() });
   v.send(posePacket());
   sendAssets(v);
   panelDirty = true;
   const cam = cams.find((c) => c.screen === v.screen);
-  toast(`Screen ${v.screen} connected${v.kind === 'local' ? ' (this computer)' : ''}${cam ? '' : ' — it has no camera yet'}`);
+  const via = { local: ' (this computer)', net: ' (direct)', relay: ' (via relay)' }[v.kind] || '';
+  toast(`Screen ${v.screen} connected${via}${cam ? '' : ' — it has no camera yet'}`);
 };
 hub.onLeave = (v, replaced) => {
   panelDirty = true;
   if (!replaced) toast(`Screen ${v.screen} disconnected`, 'muted');
 };
 hub.onStatus = () => { panelDirty = true; };
+hub.onRequest = (v, m) => {
+  if (m.t === 'resend' && v.sent) { v.sent.delete(m.id); sendAssets(v); }
+};
 hub.start();
 
 function syncTick() {
@@ -750,13 +754,20 @@ function renderPanel() {
   // ---- status
   const st = $('#status');
   const net = LOCAL_ONLY ? 'off' : hub.netStatus;
-  const netLabel = { online: 'Online — screens anywhere can join', connecting: 'Connecting…', error: hub.netError || 'Offline', off: 'Off (?local=1)' }[net];
+  const netLabel = { online: 'Ready — fastest link', connecting: 'Connecting…', error: hub.netError || 'Unavailable', off: 'Off' }[net];
+  const nr = hub.relays.length, up = hub.relayUp;
+  const relayDot = LOCAL_ONLY || !nr ? 'off' : up ? 'online' : 'connecting';
+  const relayLabel = LOCAL_ONLY || !nr ? 'Off' : up ? `Ready — any network (${up}/${nr} servers)` : 'Connecting…';
+  const counts = { local: 0, net: 0, relay: 0 };
+  for (const v of hub.viewers.values()) counts[v.kind] = (counts[v.kind] || 0) + 1;
+  const n = (k) => (counts[k] ? ` · ${counts[k]} screen${counts[k] > 1 ? 's' : ''}` : '');
   st.innerHTML = `
-    <div class="st-row"><span class="dot ${net}"></span><span>Internet</span><span class="st-val">${esc(netLabel)}</span></div>
-    <div class="st-row"><span class="dot online"></span><span>This computer</span><span class="st-val">Ready (other tabs/windows)</span></div>
-    <div class="st-row"><span class="dot none"></span><span>Room</span><span class="st-val mono">${esc(ROOM)}</span></div>
-    ${LOCAL_ONLY ? '' : `<div class="st-row" title="Needed for phones on mobile data or strict networks — see README"><span class="dot ${hub.hasTurn ? 'online' : 'none'}"></span><span>Mobile relay</span><span class="st-val">${hub.hasTurn ? 'TURN relay set up' : 'Not set up (mobile data may fail)'}</span></div>`}`;
-  $('#chip').innerHTML = `<span class="dot ${net}"></span>${hub.viewers.size} screen${hub.viewers.size === 1 ? '' : 's'} connected`;
+    <div class="st-row"><span class="dot online"></span><span>This computer</span><span class="st-val">Ready${n('local')}</span></div>
+    <div class="st-row"><span class="dot ${net}"></span><span>Direct</span><span class="st-val">${esc(netLabel)}${n('net')}</span></div>
+    <div class="st-row"><span class="dot ${relayDot}"></span><span>Relay</span><span class="st-val">${esc(relayLabel)}${n('relay')}</span></div>
+    <div class="st-row"><span class="dot none"></span><span>Room</span><span class="st-val mono">${esc(ROOM)}</span></div>`;
+  const anyNet = net === 'online' || up;
+  $('#chip').innerHTML = `<span class="dot ${anyNet ? 'online' : 'connecting'}"></span>${hub.viewers.size} screen${hub.viewers.size === 1 ? '' : 's'} connected`;
 
   // ---- cameras / screens
   const vbs = viewersByScreen();

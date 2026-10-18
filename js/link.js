@@ -1,19 +1,26 @@
 // Connection layer between the master page and the screen pages.
 //
-// Two transports run side by side:
-//   • local – BroadcastChannel. Screens opened in the same browser on the same
-//             computer as the master (e.g. one PC driving several monitors).
-//             Zero latency, works with no internet at all.
-//   • net   – PeerJS / WebRTC data channels. Screens on any other computer.
-//             A free public signalling server introduces the browsers, then
-//             data flows directly between them.
+// Three transports, tried from fastest to most robust:
+//   • local  – BroadcastChannel. Screens in the same browser on the same
+//              computer as the master (one PC driving several monitors).
+//              Instant, works with no internet.
+//   • direct – PeerJS / WebRTC. A browser-to-browser link; lowest latency
+//              across computers, but some networks block it.
+//   • relay  – Public MQTT servers over secure WebSockets (relay.js). Works on
+//              any network; a little more latency.
+// A screen connects through the relay right away (if no local master) and
+// upgrades to a direct link in the background when one can be made.
 
-import { ROOM, BASE, peerOptions, hasOwnTurn, LOCAL_ONLY, NET_ONLY } from './config.js';
+import { ROOM, BASE, PARAMS, peerOptions, hasOwnTurn, LOCAL_ONLY, NET_ONLY } from './config.js';
+import { P, RELAY_OFF, relayBrokers, loadMqtt, connectBroker, pack, unpack, PacedSender } from './relay.js';
 
 const MASTER_PEER_ID = `s3d-${ROOM}-master`;
 const CHANNEL_NAME = `s3d:${ROOM}`;
 const ALIVE_MS = 2000;
-const TIMEOUT_MS = 7000;
+const TIMEOUT_MS = 8000;
+const RELAY_TIMEOUT_MS = 12000;
+export const DIRECT_OFF = PARAMS.get('direct') === 'off';
+const RELAY_POSE_MS = 33; // ≈30 pose updates per second through the relay
 
 let peerLibPromise = null;
 function loadPeerJS() {
@@ -31,29 +38,39 @@ function loadPeerJS() {
 }
 
 const rid = () => Math.random().toString(36).slice(2, 10);
+const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
 
 // ===========================================================================
 //  Master side
 // ===========================================================================
 export class MasterHub {
   constructor() {
-    this.viewers = new Map(); // key -> { key, screen, kind, send, last, info }
+    this.viewers = new Map(); // viewer id -> { id, kind, screen, send, last, have }
     this.onJoin = () => {};
     this.onLeave = () => {};
     this.onStatus = () => {};
-    this.netStatus = LOCAL_ONLY ? 'off' : 'connecting';
+    this.onRequest = () => {};
+    this.netStatus = LOCAL_ONLY || DIRECT_OFF ? 'off' : 'connecting';
     this.netError = '';
+    this.relays = []; // { url, client, up }
+    this.sessionId = rid();
   }
 
   start() {
     if (!NET_ONLY) this._startLocal();
-    if (!LOCAL_ONLY) this._startNet();
+    if (!LOCAL_ONLY && !DIRECT_OFF) this._startNet();
+    if (!LOCAL_ONLY && !RELAY_OFF) this._startRelay();
     setInterval(() => this._tick(), ALIVE_MS);
     addEventListener('pagehide', () => {
       this.broadcast({ t: 'bye' });
+      for (const r of this.relays) {
+        try { r.client.publish(P + '/p', JSON.stringify({ on: 0 }), { qos: 0, retain: true }); } catch {}
+      }
       if (this.peer) this.peer.destroy();
     });
   }
+
+  get relayUp() { return this.relays.filter((r) => r.up).length; }
 
   // ---- local ------------------------------------------------------------
   _startLocal() {
@@ -62,22 +79,16 @@ export class MasterHub {
     ch.onmessage = (ev) => {
       const { from, to, m } = ev.data || {};
       if (to !== 'master' || !m) return;
-      const key = 'local:' + from;
       if (m.t === 'probe') {
         ch.postMessage({ from: 'master', to: from, m: { t: 'probe-ok' } });
-      } else if (m.t === 'join') {
-        this._register(key, 'local', m, (msg) => ch.postMessage({ from: 'master', to: from, m: msg }));
-      } else if (m.t === 'leave') {
-        this._drop(key);
-      } else {
-        const v = this.viewers.get(key);
-        if (v) v.last = performance.now();
+        return;
       }
+      this._incoming(from, 'local', m, (msg) => ch.postMessage({ from: 'master', to: from, m: msg }));
     };
     ch.postMessage({ from: 'master', to: '*', m: { t: 'master-up' } });
   }
 
-  // ---- net --------------------------------------------------------------
+  // ---- direct (WebRTC) --------------------------------------------------
   async _startNet() {
     let Peer;
     try { Peer = await loadPeerJS(); }
@@ -116,39 +127,96 @@ export class MasterHub {
   }
 
   _acceptConn(conn) {
-    const key = 'net:' + conn.peer + ':' + conn.connectionId;
+    let id = null;
+    const send = (msg) => { if (conn.open) conn.send(msg); };
     conn.on('data', (m) => {
       if (!m || typeof m !== 'object') return;
-      if (m.t === 'join') {
-        this._register(key, 'net', m, (msg) => { if (conn.open) conn.send(msg); });
-      } else {
-        const v = this.viewers.get(key);
-        if (v) v.last = performance.now();
-      }
+      if (m.t === 'join') id = m.id;
+      if (id) this._incoming(id, 'net', m, send);
     });
-    conn.on('close', () => this._drop(key));
-    conn.on('error', () => this._drop(key));
-    const v = { conn };
-    this._pendingConns = this._pendingConns || new Map();
-    this._pendingConns.set(key, v);
+    const gone = () => { if (id) this._drop(id, 'net'); };
+    conn.on('close', gone);
+    conn.on('error', gone);
+  }
+
+  // ---- relay (MQTT) -----------------------------------------------------
+  async _startRelay() {
+    let mqtt;
+    try { mqtt = await loadMqtt(); }
+    catch (e) { console.warn('relay library failed to load', e); return; }
+    for (const url of relayBrokers()) {
+      const r = { url, up: false, client: null, senders: new Map() };
+      this.relays.push(r);
+      const client = (r.client = connectBroker(mqtt, url, {
+        will: { topic: P + '/p', payload: JSON.stringify({ on: 0 }), qos: 0, retain: true },
+      }));
+      client.on('connect', () => {
+        r.up = true;
+        client.subscribe(P + '/u', { qos: 1 });
+        client.publish(P + '/p', JSON.stringify({ on: 1, s: this.sessionId }), { qos: 0, retain: true });
+        this.onStatus();
+      });
+      client.on('close', () => { if (r.up) { r.up = false; this.onStatus(); } });
+      client.on('error', () => {});
+      client.on('message', (topic, payload) => {
+        let m;
+        try { m = unpack(payload); } catch { return; }
+        if (!m || !m.from) return;
+        const id = m.from;
+        if (m.t === 'leave') { this._drop(id, 'relay'); return; }
+        let sender = r.senders.get(id);
+        if (!sender) { sender = new PacedSender(client, `${P}/v/${id}`); r.senders.set(id, sender); }
+        const send = (msg) => {
+          if (msg.t === 'chunk') sender.push(pack(msg));
+          else client.publish(`${P}/v/${id}`, pack(msg), { qos: msg.t === 'pose' ? 0 : 1 });
+        };
+        this._incoming(id, 'relay', m, send, r);
+      });
+    }
   }
 
   // ---- bookkeeping ------------------------------------------------------
-  _register(key, kind, m, send) {
-    const existing = this.viewers.get(key);
-    const v = { key, kind, screen: +m.screen || 0, send, last: performance.now(), info: m.info || '' };
-    this.viewers.set(key, v);
-    if (existing) this.onLeave(existing, true);
+  _incoming(id, kind, m, send, relay = null) {
+    if (m.t === 'join') {
+      this._register(id, kind, m, send, relay);
+      return;
+    }
+    const v = this.viewers.get(id);
+    if (!v) {
+      // A screen we don't know (e.g. after the master reloaded): ask it to join.
+      if (m.t === 'ping') send({ t: 'rejoin' });
+      return;
+    }
+    if (v.kind !== kind) return;
+    v.last = performance.now();
+    if (m.t === 'leave') this._drop(id, kind);
+    else if (m.t === 'resend') this.onRequest(v, m);
+  }
+
+  _register(id, kind, m, send, relay) {
+    const existing = this.viewers.get(id);
+    const v = {
+      id, key: id, kind, relay, screen: +m.screen || 0, send,
+      last: performance.now(), have: new Set(m.have || []),
+    };
+    this.viewers.set(id, v);
+    if (existing) {
+      if (existing.kind === 'relay' && existing.relay && existing !== v) {
+        const s = existing.relay.senders.get(id);
+        if (s && kind !== 'relay') { s.close(); existing.relay.senders.delete(id); }
+      }
+      this.onLeave(existing, true);
+    }
     this.onJoin(v);
   }
 
-  _drop(key) {
-    const v = this.viewers.get(key);
-    if (!v) return;
-    this.viewers.delete(key);
-    if (v.kind === 'net' && this._pendingConns) {
-      const p = this._pendingConns.get(key);
-      if (p) { try { p.conn.close(); } catch {} this._pendingConns.delete(key); }
+  _drop(id, kind) {
+    const v = this.viewers.get(id);
+    if (!v || (kind && v.kind !== kind)) return;
+    this.viewers.delete(id);
+    if (v.relay) {
+      const s = v.relay.senders.get(id);
+      if (s) { s.close(); v.relay.senders.delete(id); }
     }
     this.onLeave(v, false);
   }
@@ -156,9 +224,14 @@ export class MasterHub {
   _tick() {
     const now = performance.now();
     for (const v of [...this.viewers.values()]) {
-      if (now - v.last > TIMEOUT_MS) this._drop(v.key);
+      if (now - v.last > (v.kind === 'relay' ? RELAY_TIMEOUT_MS : TIMEOUT_MS)) this._drop(v.id);
     }
     this.broadcast({ t: 'alive' });
+    // refresh presence now and then (public servers may drop retained messages)
+    if (!this._presenceN || ++this._presenceN % 15 === 0) {
+      this._presenceN = this._presenceN || 1;
+      for (const r of this.relays) if (r.up) r.client.publish(P + '/p', JSON.stringify({ on: 1, s: this.sessionId }), { qos: 0, retain: true });
+    }
   }
 
   _setNet(status, err = '') {
@@ -168,8 +241,31 @@ export class MasterHub {
   }
 
   broadcast(msg) {
-    for (const v of this.viewers.values()) v.send(msg);
+    const relayUsed = new Set();
+    for (const v of this.viewers.values()) {
+      if (v.kind === 'relay') relayUsed.add(v.relay);
+      else v.send(msg);
+    }
     if (msg.t === 'bye' && this.channel) this.channel.postMessage({ from: 'master', to: '*', m: msg });
+    if (!relayUsed.size && msg.t !== 'bye') return;
+
+    // One publish per relay server reaches every relay screen on it.
+    if (msg.t === 'pose') {
+      this._pendingPose = msg;
+      this._pendingRelays = relayUsed;
+      if (this._poseTimer) return;
+      const wait = Math.max(0, RELAY_POSE_MS - (performance.now() - (this._lastRelayPose || 0)));
+      this._poseTimer = setTimeout(() => {
+        this._poseTimer = null;
+        this._lastRelayPose = performance.now();
+        const p = pack(this._pendingPose);
+        for (const r of this._pendingRelays) if (r.up) r.client.publish(P + '/m', p, { qos: 0 });
+      }, wait);
+      return;
+    }
+    const targets = msg.t === 'bye' ? this.relays : relayUsed;
+    const p = pack(msg);
+    for (const r of targets) if (r.up) r.client.publish(P + '/m', p, { qos: msg.t === 'alive' ? 0 : 1 });
   }
 }
 
@@ -180,12 +276,15 @@ export class ViewerLink {
   constructor(screen) {
     this.screen = screen;
     this.id = rid();
-    this.mode = null; // 'local' | 'net' | null
+    this.mode = null; // 'local' | 'net' | 'relay' | null
     this.connected = false;
     this.onMessage = () => {};
     this.onStatus = () => {};
     this.status = 'Looking for the master…';
     this.lastHeard = 0;
+    this.have = () => [];
+    this.relayHost = '';
+    this.problem = null;
   }
 
   start() {
@@ -198,29 +297,57 @@ export class ViewerLink {
     this._attempt();
   }
 
-  _set(connected, mode, status) {
-    this.connected = connected;
+  _set(mode, status) {
     this.mode = mode;
+    this.connected = !!mode;
+    if (mode) this.problem = null;
+    this.status = status;
+    this.onStatus();
+  }
+  _note(status, problem) {
+    if (this.connected) return;
+    if (problem !== undefined) this.problem = problem;
     this.status = status;
     this.onStatus();
   }
 
-  // Try same-computer first (instant), then the network.
+  _joinMsg() { return { t: 'join', id: this.id, screen: this.screen, have: this.have(), info: navigator.userAgent }; }
+
+  // Same computer first (instant), otherwise relay + direct in parallel.
   async _attempt() {
     if (this.connected || this._attempting) return;
     this._attempting = true;
     try {
-      if (this.channel && await this._probeLocal()) {
-        this._joinLocal();
-        return;
-      }
-      if (!LOCAL_ONLY) await this._connectNet();
-      else { this._set(false, null, 'Waiting for the master on this computer…'); this._retry(2000); }
+      if (this.channel && await this._probeLocal()) { this._joinLocal(); return; }
+      if (LOCAL_ONLY) { this._note('Waiting for the master on this computer…'); this._retry(2000); return; }
+      if (!RELAY_OFF) this._relayJoin();
+      if (!DIRECT_OFF) this._tryDirect();
+      this._retry(this.relay ? 3000 : 6000);
     } finally {
       this._attempting = false;
     }
   }
 
+  _retry(ms = 3000) {
+    clearTimeout(this._retryTimer);
+    this._retryTimer = setTimeout(() => this._attempt(), ms);
+  }
+
+  _activate(mode, status) {
+    // Switching to the relay keeps a pending direct attempt alive (to upgrade later).
+    if (mode === 'local' && this.net) this._closeNet();
+    this.lastHeard = performance.now();
+    this._set(mode, status);
+  }
+
+  _lost(why) {
+    const was = this.mode;
+    if (was === 'net') this._closeNet();
+    this._set(null, why + ' — reconnecting…');
+    this._retry(was === 'relay' ? 500 : 1500);
+  }
+
+  // ---- local ------------------------------------------------------------
   _probeLocal() {
     return new Promise((resolve) => {
       this._probeResolve = resolve;
@@ -235,29 +362,116 @@ export class ViewerLink {
     if (m.t === 'probe-ok' && this._probeResolve) {
       const r = this._probeResolve; this._probeResolve = null; r(true); return;
     }
-    if (m.t === 'master-up' && !this.connected) {
-      if (this._attempting) this._retry(450); else this._attempt();
+    if (m.t === 'master-up' && this.mode !== 'local') {
+      // A master just opened on this computer: always prefer it.
+      this._probeLocal().then((ok) => ok && this._joinLocal());
       return;
     }
     if (this.mode !== 'local') return;
     if (m.t === 'bye') { this._lost('Master closed'); return; }
-    this.lastHeard = performance.now();
-    this.onMessage(m);
+    this._deliver(m);
   }
 
   _joinLocal() {
-    if (this.net) this._closeNet();
-    this.lastHeard = performance.now();
-    this._set(true, 'local', 'Connected (same computer)');
-    this.channel.postMessage({ from: this.id, to: 'master', m: { t: 'join', screen: this.screen, info: navigator.userAgent } });
+    this._activate('local', 'Connected (same computer)');
+    this.channel.postMessage({ from: this.id, to: 'master', m: this._joinMsg() });
   }
 
-  async _connectNet() {
+  // ---- relay ------------------------------------------------------------
+  async _relayJoin() {
+    if (this.relay && this.relay.client.connected) {
+      this._relayPublish(this._joinMsg());
+      return;
+    }
+    if (this._relayConnecting) return;
+    this._relayConnecting = true;
+    try {
+      const mqtt = await loadMqtt();
+      // Try every relay server at once; the first one where the master is found wins.
+      this._note('Connecting through the relay servers…');
+      const results = await Promise.all(relayBrokers().map((url) => this._tryBroker(mqtt, url)));
+      if (results.some(Boolean)) return;
+      this._note(this.problem === 'no-master-relay'
+        ? `No master answered in room “${ROOM}”. Is the master page open?`
+        : 'Could not reach any relay server from this network. Retrying…',
+      this.problem === 'no-master-relay' ? 'no-master' : 'no-relay');
+    } catch (e) {
+      console.warn('relay failed', e);
+    } finally {
+      this._relayConnecting = false;
+    }
+  }
+
+  // Connect to one broker and ask the master for the scene. Resolves with the
+  // relay handle if the master answered (or we are already connected another
+  // way and just keep this one on standby), or null.
+  _tryBroker(mqtt, url) {
+    return new Promise((resolve) => {
+      const client = connectBroker(mqtt, url, { reconnectPeriod: 3000 });
+      const r = { url, client };
+      const mineTopic = `${P}/v/${this.id}`;
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (ok && this.relay && this.relay !== r && this.relay.client.connected) ok = false; // another server won
+        if (ok) { this.relay = r; this.relayHost = hostOf(url); resolve(r); }
+        else { client.end(true); resolve(null); }
+      };
+      let timer = setTimeout(() => finish(false), 11000);
+      client.on('error', () => {});
+      client.on('connect', () => {
+        client.subscribe([P + '/m', P + '/p', mineTopic], { qos: 1 }, () => {
+          const otherwise = this.connected && this.mode !== 'relay';
+          if (!settled && otherwise) { finish(true); return; } // standby
+          if (settled && this.relay === r && this.mode !== 'relay' && this.connected) return;
+          this._relayPublish(this._joinMsg(), client);
+          if (!settled) {
+            // The master's presence (a retained message) tells us it uses this
+            // server too. No presence within a few seconds → try the next one.
+            if (!this.relay) this._note(`Relay server ${hostOf(url)} reached, looking for the master…`);
+            clearTimeout(timer);
+            timer = setTimeout(() => { this.problem = 'no-master-relay'; finish(false); }, 5000);
+          }
+        });
+      });
+      client.on('message', (topic, payload) => {
+        if (topic === P + '/p') {
+          let pr; try { pr = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+          if (pr && pr.on === 1 && !settled) {
+            finish(true); // master is on this server; the join (re-sent until answered) will get a reply
+            if (this.relay === r) this._note(`Master found via ${hostOf(url)}, waiting for its answer…`);
+          }
+          if (pr && pr.on === 0 && this.mode === 'relay' && this.relay === r) this._lost('Master closed');
+          return;
+        }
+        const mine = topic === mineTopic;
+        if (topic !== P + '/m' && !mine) return;
+        let m; try { m = unpack(payload); } catch { return; }
+        if (mine && !settled) finish(true);
+        if (this.relay !== r) return;
+        if (mine && !this.connected) this._activate('relay', `Connected through relay (${this.relayHost})`);
+        if (this.mode !== 'relay') return;
+        if (m.t === 'bye') { this._lost('Master closed'); return; }
+        this._deliver(m);
+      });
+    });
+  }
+
+  _relayPublish(msg, client = this.relay && this.relay.client) {
+    if (!client) return;
+    client.publish(P + '/u', pack({ ...msg, from: this.id }), { qos: msg.t === 'ping' ? 0 : 1 });
+  }
+
+  // ---- direct (WebRTC) --------------------------------------------------
+  async _tryDirect() {
+    if (this._directBusy || this.mode === 'net' || this.mode === 'local') return;
+    if (this._directBlockedUntil && performance.now() < this._directBlockedUntil) return;
+    this._directBusy = true;
     let Peer;
     try { Peer = await loadPeerJS(); }
-    catch { this._set(false, null, 'Could not load the networking library'); this._retry(); return; }
-
-    this._set(false, null, 'Connecting over the internet…');
+    catch { this._directBusy = false; return; }
     const opts = await peerOptions();
     if (!this.peer || this.peer.destroyed) {
       await new Promise((resolve) => {
@@ -268,14 +482,13 @@ export class ViewerLink {
         peer.on('error', (err) => {
           const type = err && err.type;
           if (type === 'peer-unavailable') {
-            this.problem = 'no-master';
-            this._set(false, null, `No master found in room “${ROOM}”. Is the master page open (with the same room)?`);
-            this._retry();
+            if (RELAY_OFF) this._note(`No master found in room “${ROOM}”. Is the master page open (with the same room)?`, 'no-master');
+            this._directBlockedUntil = performance.now() + 5000;
+            this._directBusy = false;
           } else if (['network', 'server-error', 'socket-error', 'socket-closed', 'unavailable-id'].includes(type)) {
-            this.problem = 'no-server';
-            this._set(false, null, 'Cannot reach the signalling server (check this device’s internet). Retrying…');
             peer.destroy();
-            this._retry();
+            this._directBlockedUntil = performance.now() + 15000;
+            this._directBusy = false;
           } else {
             console.warn('[peer]', type, err);
           }
@@ -285,65 +498,76 @@ export class ViewerLink {
         setTimeout(finish, 10000);
       });
     }
-    if (!this.peer || this.peer.destroyed || !this.peer.open) { this._retry(); return; }
+    if (!this.peer || this.peer.destroyed || !this.peer.open) { this._directBusy = false; return; }
 
     const conn = this.peer.connect(MASTER_PEER_ID, { reliable: true });
     this.net = conn;
-    this._set(false, null, `Looking for the master in room ${ROOM}…`);
     conn.on('open', () => {
       if (this.net !== conn) return;
+      this._directBusy = false;
       if (this.mode === 'local') { conn.close(); return; }
-      this.lastHeard = performance.now();
-      this.problem = null;
-      this._set(true, 'net', 'Connected over the internet');
-      conn.send({ t: 'join', screen: this.screen, info: navigator.userAgent });
+      const upgraded = this.mode === 'relay';
+      this._activate('net', 'Connected directly' + (upgraded ? ' (upgraded from relay)' : ''));
+      conn.send(this._joinMsg());
     });
     conn.on('data', (m) => {
-      if (this.net !== conn || !m) return;
+      if (this.net !== conn || !m || this.mode !== 'net') return;
       if (m.t === 'bye') { this._lost('Master closed'); return; }
-      this.lastHeard = performance.now();
-      this.onMessage(m);
+      this._deliver(m);
     });
-    conn.on('close', () => { if (this.net === conn) this._lost('Connection closed'); });
-    conn.on('error', () => { if (this.net === conn) this._lost('Connection error'); });
+    const fail = () => {
+      if (this.net !== conn) return;
+      this._directBusy = false;
+      if (this.mode === 'net') this._lost('Direct link closed');
+      else this._closeNet();
+    };
+    conn.on('close', fail);
+    conn.on('error', fail);
     setTimeout(() => {
-      if (this.net === conn && !this.connected) {
-        this.problem = 'blocked';
-        this._lost('Found the master, but this network blocked the direct link (common on mobile data) — a TURN relay is needed, see README');
+      if (this.net === conn && conn.open !== true) {
+        // Blocked by the network. Fine if the relay is working; try again later.
+        this._directBusy = false;
+        this._directBlockedUntil = performance.now() + 60000;
+        this._closeNet();
+        if (RELAY_OFF) this._note('Found the master, but this network blocks the direct link.', 'blocked');
       }
-    }, 15000);
+    }, 12000);
   }
 
   _closeNet() {
     const c = this.net;
     this.net = null;
+    this._directBusy = false;
     if (c) try { c.close(); } catch {}
   }
 
-  _lost(why) {
-    if (this.mode === 'net') this._closeNet();
-    this._set(false, null, why + ' — reconnecting…');
-    this._retry(1500);
-  }
-
-  _retry(ms = 3000) {
-    clearTimeout(this._retryTimer);
-    this._retryTimer = setTimeout(() => this._attempt(), ms);
+  // ---- common -------------------------------------------------------------
+  _deliver(m) {
+    this.lastHeard = performance.now();
+    if (m.t === 'alive' || m.t === 'rejoin') {
+      if (m.t === 'rejoin') this.send(this._joinMsg());
+      return;
+    }
+    this.onMessage(m);
   }
 
   _tick() {
     if (!this.connected) return;
-    if (performance.now() - this.lastHeard > TIMEOUT_MS) { this._lost('Master not responding'); return; }
+    const limit = this.mode === 'relay' ? RELAY_TIMEOUT_MS : TIMEOUT_MS;
+    if (performance.now() - this.lastHeard > limit) { this._lost('Master not responding'); return; }
     this.send({ t: 'ping' });
+    // While on the relay, keep trying to upgrade to a direct link.
+    if (this.mode === 'relay' && !DIRECT_OFF) this._tryDirect();
   }
 
   send(msg) {
     if (this.mode === 'local') this.channel.postMessage({ from: this.id, to: 'master', m: msg });
     else if (this.mode === 'net' && this.net && this.net.open) this.net.send(msg);
+    else if (this.mode === 'relay') this._relayPublish(msg);
   }
 
   _leave() {
-    if (this.mode === 'local') this.send({ t: 'leave' });
+    if (this.mode === 'local' || this.mode === 'relay') this.send({ t: 'leave' });
     if (this.peer) this.peer.destroy();
   }
 }

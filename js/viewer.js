@@ -98,8 +98,24 @@ function playClip(it) {
   if (clip) { it.action = it.mixer.clipAction(clip); it.action.play(); }
 }
 
+// Through the relay, poses arrive ~30×/s with some jitter: glide towards them.
+const camTarget = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), has: false };
+const tmpCam = new THREE.PerspectiveCamera();
 function applyPose(p) {
-  if (myCamId && p.c && p.c[myCamId]) C.applyCamPose(cam, p.c[myCamId]);
+  if (myCamId && p.c && p.c[myCamId]) {
+    if (link.mode === 'relay') {
+      tmpCam.fov = cam.fov;
+      C.applyCamPose(tmpCam, p.c[myCamId]);
+      camTarget.pos.copy(tmpCam.position);
+      camTarget.quat.copy(tmpCam.quaternion);
+      if (!camTarget.has) { cam.position.copy(tmpCam.position); cam.quaternion.copy(tmpCam.quaternion); }
+      camTarget.has = true;
+      if (tmpCam.fov !== cam.fov) { cam.fov = tmpCam.fov; cam.updateProjectionMatrix(); }
+    } else {
+      camTarget.has = false;
+      C.applyCamPose(cam, p.c[myCamId]);
+    }
+  }
   if (p.o) {
     for (const id in p.o) {
       const it = items.get(id);
@@ -113,10 +129,14 @@ function applyPose(p) {
 
 // ---- model files streamed from the master ---------------------------------
 function onAsset(m) {
+  const prev = incoming.get(m.id);
+  if (prev && prev.files.length === m.files.length && prev.files.every((f, i) => f.size === m.files[i].size)) return; // resume
+  if (items.get(m.id) && items.get(m.id).model) return; // already have it
   incoming.set(m.id, {
     main: m.main,
-    files: m.files.map((f) => ({ name: f.name, size: f.size, buf: new Uint8Array(f.size), got: 0 })),
+    files: m.files.map((f) => ({ name: f.name, size: f.size, buf: new Uint8Array(f.size), got: 0, offs: new Set() })),
     got: 0,
+    startAt: performance.now(),
     total: m.files.reduce((s, f) => s + f.size, 0),
   });
   checkAssetDone(m.id);
@@ -127,10 +147,13 @@ function onChunk(m) {
   const inc = incoming.get(m.id);
   if (!inc) return;
   const f = inc.files[m.f];
+  if (!f || f.offs.has(m.off)) return;
+  f.offs.add(m.off);
   const data = new Uint8Array(m.data);
   f.buf.set(data, m.off);
   f.got += data.byteLength;
   inc.got += data.byteLength;
+  inc.lastAt = performance.now();
   checkAssetDone(m.id);
   updateOverlay();
 }
@@ -149,6 +172,17 @@ function checkAssetDone(id) {
 //  Connection
 // ---------------------------------------------------------------------------
 const link = new ViewerLink(SCREEN);
+link.have = () => [...items.entries()].filter(([, it]) => it.model && it.kind === 'file').map(([id]) => id);
+// If a model transfer stalls (e.g. the connection switched mid-way), ask again.
+setInterval(() => {
+  const now = performance.now();
+  for (const [id, inc] of incoming) {
+    if (now - (inc.lastAt || inc.startAt) > 10000) {
+      inc.lastAt = now;
+      link.send({ t: 'resend', id });
+    }
+  }
+}, 2000);
 link.onMessage = (m) => {
   switch (m.t) {
     case 'state': applyState(m.state); break;
@@ -179,7 +213,8 @@ function updateOverlay() {
     const hint = {
       'no-master': `No master is open in room “${ROOM}”. Open the master page, and if it shows a different room name, use the link from its “Copy all links” button.`,
       'no-server': 'This device cannot reach the internet signalling server.',
-      blocked: 'The master was found, but this network blocks the direct link between the two devices (typical on mobile data or guest Wi-Fi). Try the same Wi-Fi as the master, or set up the free TURN relay (README → “Phones / mobile data”).',
+      'no-relay': 'This device cannot reach any relay server. Check that it has internet access.',
+      blocked: 'The master was found, but this network blocks the direct link, and the relay is turned off (?relay=off).',
     }[link.problem];
     small = hint || link.status;
   } else if (!state) {
@@ -241,6 +276,11 @@ function frame() {
   for (const it of items.values()) {
     // The master sends animation time with every pose; only free-run between packets.
     if (it.mixer && it.anim) it.mixer.update(dt);
+  }
+  if (camTarget.has && link.mode === 'relay') {
+    const k = 1 - Math.exp(-dt * 18);
+    cam.position.lerp(camTarget.pos, k);
+    cam.quaternion.slerp(camTarget.quat, k);
   }
 
   const W = innerWidth, H = innerHeight;

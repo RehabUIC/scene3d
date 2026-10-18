@@ -14,17 +14,30 @@ export const CONFIG = {
   // Can also be overridden per page with ?room=something
   defaultRoom: null,
 
-  // ---- Phones on mobile data / strict networks ----------------------------
-  // Browsers normally connect directly. Mobile networks (and some campus
-  // Wi-Fi) often block that, and then a TURN relay server is needed.
-  // Easiest free option: sign up at https://www.metered.ca/tools/openrelay/
-  // (20 GB/month free — far more than this app uses) and paste your
+  // ---- Optional: TURN server for the *direct* link ------------------------
+  // Not needed: screens fall back to the relay below on networks that block
+  // direct links. A TURN server just lets the faster direct link work there
+  // too. Free option: https://www.metered.ca/tools/openrelay/ — paste your
   // credentials URL here, e.g.
   //   turnCredentialsUrl: 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=YOUR_KEY',
   turnCredentialsUrl: '',
   // …or list ICE servers yourself (used in addition to the defaults):
   //   iceServers: [{ urls: 'turn:my.turn.server:3478', username: 'u', credential: 'p' }],
   iceServers: [],
+
+  // ---- Relay (works on ANY network, no account) ---------------------------
+  // When a direct link is impossible, master and screens talk through these
+  // free public MQTT servers over secure WebSockets. Screens use the first one
+  // that works; the master connects to all of them. The first one uses port
+  // 443 (same as HTTPS), which gets through almost every firewall.
+  // Public servers: anyone who knows your room name could read the data, so
+  // use a secret ?room=… for anything private.
+  relayBrokers: [
+    'wss://mqtt.eclipseprojects.io:443/mqtt',
+    'wss://broker.emqx.io:8084/mqtt',
+    'wss://broker.hivemq.com:8884/mqtt',
+    'wss://test.mosquitto.org:8081/mqtt',
+  ],
 
   // Output aspect ratio of every screen.
   aspect: 16 / 9,
@@ -97,9 +110,10 @@ export const NET_ONLY = params.get('net') === '1';
 // Keep the room / server overrides when building links to other pages.
 function carriedQuery(extra = {}) {
   const q = new URLSearchParams();
-  for (const k of ['room', 'peerhost', 'peerport', 'peerpath', 'peersecure', 'local', 'net']) {
+  for (const k of ['room', 'peerhost', 'peerport', 'peerpath', 'peersecure', 'local', 'net', 'turn']) {
     if (params.has(k)) q.set(k, params.get(k));
   }
+  for (const r of params.getAll('relay')) q.append('relay', r);
   for (const [k, v] of Object.entries(extra)) q.set(k, v);
   const s = q.toString();
   return s ? '?' + s : '';
