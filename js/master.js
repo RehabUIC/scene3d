@@ -574,6 +574,7 @@ function syncTick() {
   const s = JSON.stringify(pkt);
   if (s !== lastPoseStr) {
     lastPoseStr = s;
+    pkt.tm = Math.round(performance.now() * 10) / 10; // master clock, for smooth playback on screens
     hub.broadcast(pkt);
   }
 }

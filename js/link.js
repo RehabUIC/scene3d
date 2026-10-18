@@ -54,6 +54,7 @@ export class MasterHub {
     this.netError = '';
     this.relays = []; // { url, client, up }
     this.sessionId = rid();
+    this._seq = 0;
   }
 
   start() {
@@ -258,14 +259,14 @@ export class MasterHub {
       this._poseTimer = setTimeout(() => {
         this._poseTimer = null;
         this._lastRelayPose = performance.now();
-        const p = pack(this._pendingPose);
-        for (const r of this._pendingRelays) if (r.up) r.client.publish(P + '/m', p, { qos: 0 });
+        const p = pack({ ...this._pendingPose, q: ++this._seq, s: this.sessionId });
+        // Sent through every relay server: screens use whichever copy arrives first.
+        for (const r of this.relays) if (r.up) r.client.publish(P + '/m', p, { qos: 0 });
       }, wait);
       return;
     }
-    const targets = msg.t === 'bye' ? this.relays : relayUsed;
-    const p = pack(msg);
-    for (const r of targets) if (r.up) r.client.publish(P + '/m', p, { qos: msg.t === 'alive' ? 0 : 1 });
+    const p = pack({ ...msg, q: ++this._seq, s: this.sessionId });
+    for (const r of this.relays) if (r.up) r.client.publish(P + '/m', p, { qos: msg.t === 'alive' ? 0 : 1 });
   }
 }
 
@@ -285,6 +286,7 @@ export class ViewerLink {
     this.have = () => [];
     this.relayHost = '';
     this.problem = null;
+    this.extraRelays = new Set();
   }
 
   start() {
@@ -415,9 +417,18 @@ export class ViewerLink {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (ok && this.relay && this.relay !== r && this.relay.client.connected) ok = false; // another server won
-        if (ok) { this.relay = r; this.relayHost = hostOf(url); resolve(r); }
-        else { client.end(true); resolve(null); }
+        if (ok && this.relay && this.relay !== r && this.relay.client.connected) {
+          // Another server won. Keep this one too: broadcasts (camera moves)
+          // come through every server and we use whichever copy is first.
+          this.extraRelays.add(r);
+          resolve(null);
+          return;
+        }
+        if (ok) {
+          this.relay = r; this.extraRelays.delete(r); this.relayHost = hostOf(url); resolve(r);
+          if (!this.connected) this._relayPublish(this._joinMsg(), client); // make sure the master answers here
+        }
+        else { this.extraRelays.delete(r); client.end(true); resolve(null); }
       };
       let timer = setTimeout(() => finish(false), 11000);
       client.on('error', () => {});
@@ -425,7 +436,8 @@ export class ViewerLink {
         client.subscribe([P + '/m', P + '/p', mineTopic], { qos: 1 }, () => {
           const otherwise = this.connected && this.mode !== 'relay';
           if (!settled && otherwise) { finish(true); return; } // standby
-          if (settled && this.relay === r && this.mode !== 'relay' && this.connected) return;
+          if (settled && this.relay !== r) return; // extra receiver: just listen
+          if (settled && this.mode !== 'relay' && this.connected) return;
           this._relayPublish(this._joinMsg(), client);
           if (!settled) {
             // The master's presence (a retained message) tells us it uses this
@@ -439,6 +451,7 @@ export class ViewerLink {
       client.on('message', (topic, payload) => {
         if (topic === P + '/p') {
           let pr; try { pr = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+          if (pr && pr.on === 1 && !settled && this.relay && this.relay !== r) { finish(true); return; } // becomes an extra receiver
           if (pr && pr.on === 1 && !settled) {
             finish(true); // master is on this server; the join (re-sent until answered) will get a reply
             if (this.relay === r) this._note(`Master found via ${hostOf(url)}, waiting for its answer…`);
@@ -450,9 +463,24 @@ export class ViewerLink {
         if (topic !== P + '/m' && !mine) return;
         let m; try { m = unpack(payload); } catch { return; }
         if (mine && !settled) finish(true);
-        if (this.relay !== r) return;
+        if (mine && this.relay !== r && this.extraRelays.has(r)) {
+          // The master answers through this server: make it the main one.
+          if (this.relay) this.extraRelays.add(this.relay);
+          this.extraRelays.delete(r);
+          this.relay = r;
+          this.relayHost = hostOf(url);
+        }
+        const primary = this.relay === r;
+        if (!primary && !(this.extraRelays.has(r) && !mine)) return;
         if (mine && !this.connected) this._activate('relay', `Connected through relay (${this.relayHost})`);
         if (this.mode !== 'relay') return;
+        if (m.q != null) {
+          // de-duplicate broadcasts that arrive through several servers
+          if (m.s !== this._bcSession) { this._bcSession = m.s; this._bcSeq = 0; }
+          if (m.q <= this._bcSeq) return;
+          this._bcSeq = m.q;
+          this.bcVia = hostOf(url);
+        }
         if (m.t === 'bye') { this._lost('Master closed'); return; }
         this._deliver(m);
       });

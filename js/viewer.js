@@ -98,23 +98,79 @@ function playClip(it) {
   if (clip) { it.action = it.mixer.clipAction(clip); it.action.play(); }
 }
 
-// Through the relay, poses arrive ~30×/s with some jitter: glide towards them.
-const camTarget = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), has: false };
-const tmpCam = new THREE.PerspectiveCamera();
+// ---------------------------------------------------------------------------
+//  Smooth playback for relay connections.
+//  Updates through public servers can arrive late or in bursts. Each pose
+//  carries the master's clock (tm); we keep a short buffer and play it back
+//  slightly in the past at an even pace. The delay adapts to how bursty the
+//  connection is (smaller = more responsive, larger = smoother).
+// ---------------------------------------------------------------------------
+const playback = {
+  snaps: [],       // { t, c, o }
+  diffs: [],       // [localTime, local - master] for the last few seconds
+  offset: 0,
+  delay: 120,
+  session: null,
+  rate: 0, count: 0,
+};
+function relayPose(p) {
+  const now = performance.now();
+  if (p.s && p.s !== playback.session) { playback.session = p.s; playback.snaps.length = 0; playback.diffs.length = 0; }
+  const diff = now - p.tm;
+  const d = playback.diffs;
+  d.push([now, diff]);
+  while (d.length && now - d[0][0] > 6000) d.shift();
+  let best = Infinity, worst = -Infinity;
+  for (const [, x] of d) { if (x < best) best = x; }
+  for (const [t, x] of d) if (now - t < 3000 && x > worst) worst = x;
+  playback.offset = best;
+  const want = Math.min(2500, Math.max(60, worst - best + 40));
+  // grow fast, shrink slowly
+  playback.delay = want > playback.delay ? want : playback.delay + (want - playback.delay) * 0.05;
+  playback.snaps.push({ t: p.tm, c: myCamId && p.c ? p.c[myCamId] : null, o: p.o || {} });
+  if (playback.snaps.length > 400) playback.snaps.splice(0, playback.snaps.length - 400);
+}
+
+const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _va = new THREE.Vector3(), _vb = new THREE.Vector3();
+function mixPose(a, b, k) {
+  _va.set(a[0], a[1], a[2]).lerp(_vb.set(b[0], b[1], b[2]), k);
+  _qa.set(a[3], a[4], a[5], a[6]).slerp(_qb.set(b[3], b[4], b[5], b[6]), k);
+  const out = [_va.x, _va.y, _va.z, _qa.x, _qa.y, _qa.z, _qa.w];
+  for (let i = 7; i < b.length; i++) out.push(i === 10 ? b[i] : a[i] + (b[i] - a[i]) * k);
+  return out;
+}
+
+function playRelay() {
+  const S = playback.snaps;
+  if (!S.length) return;
+  const rt = performance.now() - playback.offset - playback.delay;
+  // drop snapshots that are fully in the past (keep one before rt)
+  while (S.length > 2 && S[1].t <= rt) S.shift();
+  let a = S[0], b = S[1] || S[0];
+  let k = 0;
+  if (rt >= b.t) { a = b; k = 0; }
+  else if (b !== a) {
+    // after a pause the master sends nothing; don't stretch a move over the pause
+    const start = Math.max(a.t, b.t - 100);
+    k = rt <= start ? 0 : (rt - start) / (b.t - start);
+  }
+  if (a.c && b.c && myCamId) C.applyCamPose(cam, k ? mixPose(a.c, b.c, k) : a.c);
+  for (const id in b.o) {
+    const it = items.get(id);
+    if (!it) continue;
+    const pa = a.o[id] || b.o[id], pb = b.o[id];
+    const pose = k ? mixPose(pa, pb, k) : pa;
+    C.applyObjPose(it.wrapper, pose);
+    if (it.action && pose[10] >= 0) { it.action.time = pose[10]; it.mixer.update(0); }
+  }
+}
+
 function applyPose(p) {
+  playback.count++;
+  if (link.mode === 'relay' && p.tm != null) { relayPose(p); return; }
+  playback.snaps.length = 0;
   if (myCamId && p.c && p.c[myCamId]) {
-    if (link.mode === 'relay') {
-      tmpCam.fov = cam.fov;
-      C.applyCamPose(tmpCam, p.c[myCamId]);
-      camTarget.pos.copy(tmpCam.position);
-      camTarget.quat.copy(tmpCam.quaternion);
-      if (!camTarget.has) { cam.position.copy(tmpCam.position); cam.quaternion.copy(tmpCam.quaternion); }
-      camTarget.has = true;
-      if (tmpCam.fov !== cam.fov) { cam.fov = tmpCam.fov; cam.updateProjectionMatrix(); }
-    } else {
-      camTarget.has = false;
-      C.applyCamPose(cam, p.c[myCamId]);
-    }
+    C.applyCamPose(cam, p.c[myCamId]);
   }
   if (p.o) {
     for (const id in p.o) {
@@ -204,7 +260,7 @@ link.start();
 const overlay = $('#overlay'), msg = $('#msg'), sub = $('#sub'), bar = $('#bar'), barFill = $('#barFill');
 
 function updateOverlay() {
-  $('#hudStatus').textContent = `${link.status} · room ${ROOM}`;
+  hudText();
   $('#hudDot').className = 'dot ' + (link.connected ? 'online' : 'connecting');
 
   let big = '', small = '', progress = null;
@@ -238,6 +294,17 @@ function updateOverlay() {
   bar.hidden = progress === null;
   if (progress !== null) barFill.style.width = (progress * 100).toFixed(1) + '%';
 }
+
+function hudText() {
+  let t = link.status;
+  if (link.connected) {
+    t += ` · ${playback.rate} updates/s`;
+    if (link.mode === 'relay') t += ` · buffer ${Math.round(playback.delay)} ms${link.bcVia ? ' via ' + link.bcVia : ''}`;
+  }
+  $('#hudStatus').textContent = `${t} · room ${ROOM}`;
+}
+const rateWin = [];
+setInterval(() => { rateWin.push(playback.count); playback.count = 0; if (rateWin.length > 3) rateWin.shift(); playback.rate = Math.round(rateWin.reduce((a, b) => a + b, 0) / rateWin.length); hudText(); }, 1000);
 
 let flashTimer;
 function flash(t) {
@@ -277,11 +344,7 @@ function frame() {
     // The master sends animation time with every pose; only free-run between packets.
     if (it.mixer && it.anim) it.mixer.update(dt);
   }
-  if (camTarget.has && link.mode === 'relay') {
-    const k = 1 - Math.exp(-dt * 18);
-    cam.position.lerp(camTarget.pos, k);
-    cam.quaternion.slerp(camTarget.quat, k);
-  }
+  if (link.mode === 'relay') playRelay();
 
   const W = innerWidth, H = innerHeight;
   let w = W, h = H;
