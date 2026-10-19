@@ -37,17 +37,37 @@ Screen numbers don't need to exist in advance. If you open `/7` before camera 7 
 
 ### How screens connect
 
-A screen picks the best available link by itself, so there is nothing to set up:
+A screen picks the best available link by itself:
 
 1. **Same computer** (other tabs or windows of the master's browser): instant, works with no internet. This is ideal for one PC driving several monitors.
-2. **Relay** (any device, any network: mobile data, campus Wi-Fi, another city). The master and the screens exchange data through free public MQTT servers over secure WebSockets. The first server uses port 443, the same as normal HTTPS, so it gets through almost any firewall. There's no account and nothing to configure. A screen connects this way within a few seconds.
-3. **Direct** (WebRTC): in the background, every relay screen also tries a direct browser-to-browser link. If the network allows it, the screen switches to it automatically for the lowest latency.
+2. **Firebase** (any device, any network: mobile data, campus Wi-Fi, another city): real-time through your own free Firebase Realtime Database, typically 50–150 ms. The screen connects this way within a second or two.
+3. **Direct** (WebRTC): in the background, every Firebase screen also tries a direct browser-to-browser link. If the network allows it, the screen switches over automatically. This is the fastest link, and it saves Firebase quota.
 
-The master panel shows how many screens use each link, and each screen shows its link at the bottom-left.
+The master panel shows how many screens use each link. Each screen shows its link, updates per second and buffer at the bottom-left; tap the screen to see it.
 
-**Rooms and privacy:** master and screens find each other by the **room** name shown in the panel. By default it comes from your site address. The relay servers are public, so anyone who knew your room name could watch the camera data and models. For anything private, add a secret room to every link, for example `…/scene3d/?room=lab-k39x7` and `…/scene3d/1?room=lab-k39x7`. **Copy all links** keeps the room in the links for you.
+### Firebase setup (one time)
 
-Imported models are copied to each screen automatically, with a progress bar. They are also kept in the master browser's storage, so a page reload doesn't lose them. Over the relay, big models take longer, so put large files in `models/` (see below) and screens download them directly.
+The project in `js/config.js` (`scene3d-95bf0`) needs a Realtime Database with open rules for the `scene3d` path:
+
+1. Go to https://console.firebase.google.com, open the project, then **Build → Realtime Database → Create database**.
+2. For the location, pick **United States (us-central1)**, and for the security rules, start in **locked mode**.
+3. Open the **Rules** tab, replace everything with the rules below, and click **Publish**:
+   ```json
+   {
+     "rules": {
+       "scene3d": {
+         "$room": { ".read": true, ".write": true }
+       }
+     }
+   }
+   ```
+If you picked another location, copy the database address shown at the top of the Data tab into `databaseURL` in `js/config.js`.
+
+**Free plan limits (Spark):** 100 simultaneous connections, 1 GB stored, 10 GB downloaded per month. Camera updates use about 45 MB per hour of nonstop movement per Firebase screen; a still scene uses almost nothing. Screens on the same computer or on a direct link don't use Firebase at all. If the monthly limit is reached, Firebase pauses until the next month; nothing is charged.
+
+**Rooms and privacy:** master and screens find each other by the **room** name shown in the panel. By default it comes from your site address. Anyone who knew your room name could watch the scene, so for anything private, add a secret room to every link, for example `…/scene3d/?room=lab-k39x7` and `…/scene3d/1?room=lab-k39x7`. **Copy all links** keeps the room in the links for you.
+
+Imported models are copied to each screen automatically, with a progress bar. They are also kept in the master browser's storage, so a page reload doesn't lose them. Models you import are uploaded to Firebase once (up to 25 MB each) for screens on other networks; each such screen's download counts toward the 10 GB. For large models, put the files in `models/` (see below) and screens download them from GitHub instead.
 
 ### Models that live in the repo
 
@@ -65,8 +85,8 @@ They show up as one-click buttons on the master. You can also type any web addre
 |---|---|
 | `?room=name` | Use a separate room (put it on master and screens). |
 | `?local=1` | Same-computer only, no internet at all. |
-| `?relay=off` / `?direct=off` | Turn off the relay or the direct link. |
-| `?relay=wss://host/mqtt` | Use your own MQTT relay server(s) (repeat for several). |
+| `?firebase=off` / `?direct=off` | Turn off Firebase or the direct link. |
+| `?relay=wss://host/mqtt` | Also use a public or own MQTT relay server (repeat for several). |
 | `?fit=window` (screens) | Fill a non-16:9 display instead of letterboxing. |
 | `?model=models/x.glb` (master) | Load a model on start. |
 | `?scene=models/myscene.json` (master) | Start from a saved scene file. |
@@ -76,17 +96,15 @@ They show up as one-click buttons on the master. You can also type any web addre
 Read the message on the screen under "Waiting for the master":
 
 - **"No master is open in room …"**: open the master page first. Check that the room name at the bottom-left of the screen matches the one in the master's panel, and use **Copy all links** to get matching links.
-- **"Cannot reach any relay server"**: this device has no internet access, or the network blocks even secure WebSockets (very rare). Try another network.
+- **"Firebase refused access"**, or the master's Firebase line is red: the database rules aren't published, or the database doesn't exist yet. See Firebase setup above.
+- **Firebase line stuck on "Connecting…"**: the database isn't in us-central1. Set `databaseURL` in `js/config.js`.
 - **Testing from a phone against a server on your laptop:** `localhost` on the phone means the phone itself. Open `http://<your-laptop-IP>:8000/view.html?screen=1` instead. Find the IP with `ipconfig`.
-
-**Optional, for the lowest latency on strict networks:** add a TURN server so the *direct* link works there too. Sign up at https://www.metered.ca/tools/openrelay/ (free) and paste your credentials URL into `turnCredentialsUrl` in `js/config.js`. Everything works without this; it only makes the direct link possible in more places.
 
 ## Limits worth knowing
 
 - The master page must stay open. If it closes, screens freeze and reconnect automatically when it comes back.
-- The public relay and signalling servers are free community services with no uptime guarantee. Several relay servers are listed in `js/config.js`, and screens use whichever works. For a permanent installation, you can run your own (any MQTT broker with WebSockets, e.g. Mosquitto).
 - The free public PeerJS server is fine for lab and demo use but has no uptime guarantee. To run your own, deploy the open-source `peer` server (free tier on Render.com works) and set `peer: { host, port: 443, path: '/', secure: true }` in `js/config.js`.
-- Over the relay, a screen in another city sees changes a fraction of a second later than a screen on the same network.
+- Through Firebase, a screen sees changes about 0.05–0.15 s after the master; on the same computer or a direct link it's near-instant.
 - `/1`, `/2` work because GitHub Pages serves `404.html` for unknown paths. The pages work normally, but technically they return a 404 status. On other hosts, use `view.html?screen=1`.
 
 ## Files
@@ -96,11 +114,12 @@ index.html          master page
 404.html, view.html screen page (identical copies)
 js/master.js        editor, cameras, models, sync
 js/viewer.js        screen renderer
-js/link.js          connections (same computer, direct WebRTC, relay)
-js/relay.js         relay over public MQTT servers
+js/link.js          connections (same computer, direct WebRTC, Firebase, relay)
+js/fb.js            Firebase Realtime Database link
+js/relay.js         optional relay over MQTT servers
 js/common.js        shared scene, loaders, pose format
 js/config.js        settings
-lib/                three.js r186, PeerJS 1.5.5, MQTT.js 5.16 (bundled, no CDN needed)
+lib/                three.js r186, PeerJS 1.5.5, Firebase JS SDK 13.0.0, MQTT.js 5.16 (bundled)
 models/             your own models (optional)
 ```
 

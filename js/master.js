@@ -275,7 +275,7 @@ function removeObject(id) {
   content.remove(o.wrapper);
   if (o.model) C.disposeObject(o.model);
   objs.splice(objs.indexOf(o), 1);
-  if (o.kind === 'file') assetStore.del(o.id);
+  if (o.kind === 'file') { assetStore.del(o.id); if (hub.fb) hub.fb.removeAsset(o.id); }
   structural();
 }
 
@@ -528,6 +528,11 @@ function posePacket() {
 }
 
 function sendAssets(v) {
+  if (v.kind === 'fb') {
+    // Firebase screens download models from the database: upload each once.
+    for (const o of objs) if (o.kind === 'file' && o.status === 'ready' && hub.fb) hub.fb.uploadAsset(o.id, o.main, o.files);
+    return;
+  }
   v.sent = v.sent || new Set();
   for (const o of objs) {
     if (o.kind !== 'file' || o.status !== 'ready' || v.sent.has(o.id)) continue;
@@ -548,7 +553,7 @@ hub.onJoin = (v) => {
   sendAssets(v);
   panelDirty = true;
   const cam = cams.find((c) => c.screen === v.screen);
-  const via = { local: ' (this computer)', net: ' (direct)', relay: ' (via relay)' }[v.kind] || '';
+  const via = { local: ' (this computer)', net: ' (direct)', relay: ' (via relay)', fb: ' (via Firebase)' }[v.kind] || '';
   toast(`Screen ${v.screen} connected${via}${cam ? '' : ' — it has no camera yet'}`);
 };
 hub.onLeave = (v, replaced) => {
@@ -556,10 +561,21 @@ hub.onLeave = (v, replaced) => {
   if (!replaced) toast(`Screen ${v.screen} disconnected`, 'muted');
 };
 hub.onStatus = () => { panelDirty = true; };
+hub.keepAssetIds = () => objs.filter((o) => o.kind === 'file').map((o) => o.id);
 hub.onRequest = (v, m) => {
   if (m.t === 'resend' && v.sent) { v.sent.delete(m.id); sendAssets(v); }
 };
 hub.start();
+if (hub.fb) {
+  hub.fb.onAssetStatus = (id, status, size) => {
+    const o = objById(id);
+    const name = o ? o.name : 'model';
+    const mb = (size / 1048576).toFixed(1);
+    if (status === 'too-big') toast(`“${name}” (${mb} MB) is too big to send through Firebase. Put it in the site’s models/ folder for screens on other networks.`, 'warn');
+    else if (status === 'error') toast(`Could not upload “${name}” to Firebase.`, 'error');
+    else if (status === 'done' && size > 2e6) toast(`“${name}” uploaded for Firebase screens (${mb} MB).`, 'muted');
+  };
+}
 
 function syncTick() {
   if (structDirty) {
@@ -759,7 +775,7 @@ function renderPanel() {
   const nr = hub.relays.length, up = hub.relayUp;
   const relayDot = LOCAL_ONLY || !nr ? 'off' : up ? 'online' : 'connecting';
   const relayLabel = LOCAL_ONLY || !nr ? 'Off' : up ? `Ready — any network (${up}/${nr} servers)` : 'Connecting…';
-  const counts = { local: 0, net: 0, relay: 0 };
+  const counts = { local: 0, net: 0, relay: 0, fb: 0 };
   for (const v of hub.viewers.values()) counts[v.kind] = (counts[v.kind] || 0) + 1;
   const n = (k) => (counts[k] ? ` · ${counts[k]} screen${counts[k] > 1 ? 's' : ''}` : '');
   st.innerHTML = `
@@ -767,7 +783,12 @@ function renderPanel() {
     <div class="st-row"><span class="dot ${net}"></span><span>Direct</span><span class="st-val">${esc(netLabel)}${n('net')}</span></div>
     <div class="st-row"><span class="dot ${relayDot}"></span><span>Relay</span><span class="st-val">${esc(relayLabel)}${n('relay')}</span></div>
     <div class="st-row"><span class="dot none"></span><span>Room</span><span class="st-val mono">${esc(ROOM)}</span></div>`;
-  const anyNet = net === 'online' || up;
+  const fb = hub.fb;
+  const fbDot = !fb ? 'off' : fb.error ? 'error' : fb.up ? 'online' : 'connecting';
+  const fbLabel = !fb ? 'Off' : fb.error ? fb.error : fb.up ? 'Ready — any network' : 'Connecting…';
+  st.querySelectorAll('.st-row')[1].insertAdjacentHTML('afterend', `<div class="st-row"><span class="dot ${fbDot}"></span><span>Firebase</span><span class="st-val" title="${esc(fbLabel)}">${esc(fbLabel)}${n('fb')}</span></div>`);
+  if (!nr) st.querySelectorAll('.st-row')[3].remove(); // relay row: hidden when no relay servers are configured
+  const anyNet = net === 'online' || up || (fb && fb.up);
   $('#chip').innerHTML = `<span class="dot ${anyNet ? 'online' : 'connecting'}"></span>${hub.viewers.size} screen${hub.viewers.size === 1 ? '' : 's'} connected`;
 
   // ---- cameras / screens

@@ -1,18 +1,21 @@
 // Connection layer between the master page and the screen pages.
 //
-// Three transports, tried from fastest to most robust:
-//   • local  – BroadcastChannel. Screens in the same browser on the same
-//              computer as the master (one PC driving several monitors).
-//              Instant, works with no internet.
-//   • direct – PeerJS / WebRTC. A browser-to-browser link; lowest latency
-//              across computers, but some networks block it.
-//   • relay  – Public MQTT servers over secure WebSockets (relay.js). Works on
-//              any network; a little more latency.
-// A screen connects through the relay right away (if no local master) and
+// Transports, from fastest to most robust:
+//   • local    – BroadcastChannel. Screens in the same browser on the same
+//                computer as the master (one PC driving several monitors).
+//                Instant, works with no internet.
+//   • direct   – PeerJS / WebRTC. A browser-to-browser link; lowest latency
+//                across computers, but some networks block it.
+//   • firebase – Firebase Realtime Database (fb.js). Works on any network,
+//                real-time (~50–150 ms). Your own free Firebase project.
+//   • relay    – Public MQTT servers (relay.js). Off by default; optional
+//                no-account fallback.
+// A screen connects through Firebase right away (if no local master) and
 // upgrades to a direct link in the background when one can be made.
 
 import { ROOM, BASE, PARAMS, peerOptions, hasOwnTurn, LOCAL_ONLY, NET_ONLY } from './config.js';
 import { P, RELAY_OFF, relayBrokers, loadMqtt, connectBroker, pack, unpack, PacedSender } from './relay.js';
+import { FB_OFF, FbMaster, FbViewer } from './fb.js';
 
 const MASTER_PEER_ID = `s3d-${ROOM}-master`;
 const CHANNEL_NAME = `s3d:${ROOM}`;
@@ -55,12 +58,14 @@ export class MasterHub {
     this.relays = []; // { url, client, up }
     this.sessionId = rid();
     this._seq = 0;
+    this.fb = null;
   }
 
   start() {
     if (!NET_ONLY) this._startLocal();
     if (!LOCAL_ONLY && !DIRECT_OFF) this._startNet();
     if (!LOCAL_ONLY && !RELAY_OFF) this._startRelay();
+    if (!LOCAL_ONLY && !FB_OFF) { this.fb = new FbMaster(this); this.fb.start(); }
     setInterval(() => this._tick(), ALIVE_MS);
     addEventListener('pagehide', () => {
       this.broadcast({ t: 'bye' });
@@ -225,6 +230,7 @@ export class MasterHub {
   _tick() {
     const now = performance.now();
     for (const v of [...this.viewers.values()]) {
+      if (v.kind === 'fb') continue; // Firebase removes screens itself when they disconnect
       if (now - v.last > (v.kind === 'relay' ? RELAY_TIMEOUT_MS : TIMEOUT_MS)) this._drop(v.id);
     }
     this.broadcast({ t: 'alive' });
@@ -235,6 +241,20 @@ export class MasterHub {
     }
   }
 
+  // Firebase: one shared document for all Firebase screens; poses ≤30×/s.
+  _fbBroadcast(msg) {
+    if (msg.t === 'state') { this.fb.writeState(msg.state); return; }
+    if (msg.t !== 'pose') return;
+    this._fbPending = msg;
+    if (this._fbTimer) return;
+    const wait = Math.max(0, RELAY_POSE_MS - (performance.now() - (this._fbLast || 0)));
+    this._fbTimer = setTimeout(() => {
+      this._fbTimer = null;
+      this._fbLast = performance.now();
+      this.fb.writePose(this._fbPending);
+    }, wait);
+  }
+
   _setNet(status, err = '') {
     this.netStatus = status;
     this.netError = err;
@@ -243,10 +263,13 @@ export class MasterHub {
 
   broadcast(msg) {
     const relayUsed = new Set();
+    let fbUsed = false;
     for (const v of this.viewers.values()) {
       if (v.kind === 'relay') relayUsed.add(v.relay);
+      else if (v.kind === 'fb') fbUsed = true;
       else v.send(msg);
     }
+    if (fbUsed && this.fb) this._fbBroadcast(msg);
     if (msg.t === 'bye' && this.channel) this.channel.postMessage({ from: 'master', to: '*', m: msg });
     if (!relayUsed.size && msg.t !== 'bye') return;
 
@@ -287,6 +310,8 @@ export class ViewerLink {
     this.relayHost = '';
     this.problem = null;
     this.extraRelays = new Set();
+    this.fbv = null;
+    this.roomName = ROOM;
   }
 
   start() {
@@ -322,6 +347,7 @@ export class ViewerLink {
     try {
       if (this.channel && await this._probeLocal()) { this._joinLocal(); return; }
       if (LOCAL_ONLY) { this._note('Waiting for the master on this computer…'); this._retry(2000); return; }
+      if (!FB_OFF) this._fbJoin();
       if (!RELAY_OFF) this._relayJoin();
       if (!DIRECT_OFF) this._tryDirect();
       this._retry(this.relay ? 3000 : 6000);
@@ -340,7 +366,16 @@ export class ViewerLink {
     if (mode === 'local' && this.net) this._closeNet();
     this.lastHeard = performance.now();
     this._set(mode, status);
+    // On a faster link, stop using Firebase so its free quota isn't spent.
+    if ((mode === 'local' || mode === 'net') && this.fbv) this.fbv.leave();
   }
+
+  // ---- Firebase ---------------------------------------------------------
+  _fbJoin() {
+    if (!this.fbv) this.fbv = new FbViewer(this);
+    this.fbv.join();
+  }
+  _fbLost(why) { if (this.mode === 'fb') this._lost(why); }
 
   _lost(why) {
     const was = this.mode;
@@ -510,7 +545,7 @@ export class ViewerLink {
         peer.on('error', (err) => {
           const type = err && err.type;
           if (type === 'peer-unavailable') {
-            if (RELAY_OFF) this._note(`No master found in room “${ROOM}”. Is the master page open (with the same room)?`, 'no-master');
+            if (RELAY_OFF && FB_OFF) this._note(`No master found in room “${ROOM}”. Is the master page open (with the same room)?`, 'no-master');
             this._directBlockedUntil = performance.now() + 5000;
             this._directBusy = false;
           } else if (['network', 'server-error', 'socket-error', 'socket-closed', 'unavailable-id'].includes(type)) {
@@ -534,8 +569,8 @@ export class ViewerLink {
       if (this.net !== conn) return;
       this._directBusy = false;
       if (this.mode === 'local') { conn.close(); return; }
-      const upgraded = this.mode === 'relay';
-      this._activate('net', 'Connected directly' + (upgraded ? ' (upgraded from relay)' : ''));
+      const upgraded = this.mode === 'relay' || this.mode === 'fb';
+      this._activate('net', 'Connected directly' + (upgraded ? ' (upgraded)' : ''));
       conn.send(this._joinMsg());
     });
     conn.on('data', (m) => {
@@ -557,7 +592,7 @@ export class ViewerLink {
         this._directBusy = false;
         this._directBlockedUntil = performance.now() + 60000;
         this._closeNet();
-        if (RELAY_OFF) this._note('Found the master, but this network blocks the direct link.', 'blocked');
+        if (RELAY_OFF && FB_OFF) this._note('Found the master, but this network blocks the direct link.', 'blocked');
       }
     }, 12000);
   }
@@ -582,10 +617,11 @@ export class ViewerLink {
   _tick() {
     if (!this.connected) return;
     const limit = this.mode === 'relay' ? RELAY_TIMEOUT_MS : TIMEOUT_MS;
-    if (performance.now() - this.lastHeard > limit) { this._lost('Master not responding'); return; }
+    // (Firebase tells us itself when the master goes away.)
+    if (this.mode !== 'fb' && performance.now() - this.lastHeard > limit) { this._lost('Master not responding'); return; }
     this.send({ t: 'ping' });
-    // While on the relay, keep trying to upgrade to a direct link.
-    if (this.mode === 'relay' && !DIRECT_OFF) this._tryDirect();
+    // While on Firebase or the relay, keep trying to upgrade to a direct link.
+    if ((this.mode === 'relay' || this.mode === 'fb') && !DIRECT_OFF) this._tryDirect();
   }
 
   send(msg) {
@@ -596,6 +632,7 @@ export class ViewerLink {
 
   _leave() {
     if (this.mode === 'local' || this.mode === 'relay') this.send({ t: 'leave' });
+    if (this.fbv) this.fbv.leave();
     if (this.peer) this.peer.destroy();
   }
 }

@@ -25,19 +25,24 @@ export const CONFIG = {
   //   iceServers: [{ urls: 'turn:my.turn.server:3478', username: 'u', credential: 'p' }],
   iceServers: [],
 
-  // ---- Relay (works on ANY network, no account) ---------------------------
-  // When a direct link is impossible, master and screens talk through these
-  // free public MQTT servers over secure WebSockets. Screens use the first one
-  // that works; the master connects to all of them. The first one uses port
-  // 443 (same as HTTPS), which gets through almost every firewall.
-  // Public servers: anyone who knows your room name could read the data, so
-  // use a secret ?room=… for anything private.
-  relayBrokers: [
-    'wss://mqtt.eclipseprojects.io:443/mqtt',
-    'wss://broker.emqx.io:8084/mqtt',
-    'wss://broker.hivemq.com:8884/mqtt',
-    'wss://test.mosquitto.org:8081/mqtt',
-  ],
+  // ---- Firebase (real-time on ANY network) --------------------------------
+  // Screens that aren't on the master's computer connect through this
+  // Firebase Realtime Database (free Spark plan). The database address is
+  // derived from projectId (a database created in the US, us-central1).
+  // If yours is elsewhere, add  databaseURL: 'https://…firebasedatabase.app'
+  firebase: {
+    apiKey: 'AIzaSyC_pAQGCNAauFAjm58ce788xm41MUTv51E',
+    authDomain: 'scene3d-95bf0.firebaseapp.com',
+    projectId: 'scene3d-95bf0',
+    appId: '1:22859739639:web:456dbed02130b81081fef2',
+    // databaseURL: 'https://scene3d-95bf0-default-rtdb.firebaseio.com',
+  },
+
+  // ---- Public relay (optional, no account) ---------------------------------
+  // Free public MQTT servers as an extra fallback. Off by default because
+  // public servers can be slow or throttled. To turn on, list servers, e.g.
+  //   'wss://mqtt.eclipseprojects.io:443/mqtt', 'wss://broker.emqx.io:8084/mqtt'
+  relayBrokers: [],
 
   // Output aspect ratio of every screen.
   aspect: 16 / 9,

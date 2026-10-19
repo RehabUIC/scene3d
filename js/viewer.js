@@ -124,7 +124,7 @@ function relayPose(p) {
   for (const [, x] of d) { if (x < best) best = x; }
   for (const [t, x] of d) if (now - t < 3000 && x > worst) worst = x;
   playback.offset = best;
-  const want = Math.min(2500, Math.max(60, worst - best + 40));
+  const want = Math.min(2500, Math.max(40, worst - best + 30));
   // grow fast, shrink slowly
   playback.delay = want > playback.delay ? want : playback.delay + (want - playback.delay) * 0.05;
   playback.snaps.push({ t: p.tm, c: myCamId && p.c ? p.c[myCamId] : null, o: p.o || {} });
@@ -167,7 +167,7 @@ function playRelay() {
 
 function applyPose(p) {
   playback.count++;
-  if (link.mode === 'relay' && p.tm != null) { relayPose(p); return; }
+  if ((link.mode === 'relay' || link.mode === 'fb') && p.tm != null) { relayPose(p); return; }
   playback.snaps.length = 0;
   if (myCamId && p.c && p.c[myCamId]) {
     C.applyCamPose(cam, p.c[myCamId]);
@@ -270,6 +270,7 @@ function updateOverlay() {
       'no-master': `No master is open in room “${ROOM}”. Open the master page, and if it shows a different room name, use the link from its “Copy all links” button.`,
       'no-server': 'This device cannot reach the internet signalling server.',
       'no-relay': 'This device cannot reach any relay server. Check that it has internet access.',
+      'fb-denied': 'Firebase refused access. Check the Realtime Database rules (see README).',
       blocked: 'The master was found, but this network blocks the direct link, and the relay is turned off (?relay=off).',
     }[link.problem];
     small = hint || link.status;
@@ -299,7 +300,7 @@ function hudText() {
   let t = link.status;
   if (link.connected) {
     t += ` · ${playback.rate} updates/s`;
-    if (link.mode === 'relay') t += ` · buffer ${Math.round(playback.delay)} ms${link.bcVia ? ' via ' + link.bcVia : ''}`;
+    if ((link.mode === 'relay' || link.mode === 'fb')) t += ` · buffer ${Math.round(playback.delay)} ms${link.bcVia ? ' via ' + link.bcVia : ''}`;
   }
   $('#hudStatus').textContent = `${t} · room ${ROOM}`;
 }
@@ -344,7 +345,7 @@ function frame() {
     // The master sends animation time with every pose; only free-run between packets.
     if (it.mixer && it.anim) it.mixer.update(dt);
   }
-  if (link.mode === 'relay') playRelay();
+  if ((link.mode === 'relay' || link.mode === 'fb')) playRelay();
 
   const W = innerWidth, H = innerHeight;
   let w = W, h = H;
