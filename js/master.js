@@ -7,6 +7,9 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { CONFIG, ROOM, BASE, PARAMS, screenUrl, LOCAL_ONLY, resolveUrl } from './config.js';
 import { MasterHub } from './link.js';
 import * as C from './common.js';
+import { STEREO_MODES, screenSize } from './cave.js';
+import { CaveRig, HEAD_CHANNEL } from './cave-master.js';
+import { HeadTracker } from './headtrack.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -50,6 +53,7 @@ selBox.renderOrder = 999;
 selBox.visible = false;
 scene.add(selBox);
 
+const cave = new CaveRig(scene);
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 0.03;
 
@@ -389,6 +393,8 @@ function select(type, id) {
   if (sel && sel.type === 'camera') {
     const c = camById(id);
     if (c && pilot !== id) tc.attach(c.obj);
+  } else if (sel && sel.type === 'cave') {
+    tc.attach(cave.group);
   } else if (sel && sel.type === 'object') {
     const o = objById(id);
     if (o) {
@@ -403,7 +409,7 @@ function select(type, id) {
 }
 
 function applyTcMode() {
-  const isCam = sel && sel.type === 'camera';
+  const isCam = sel && (sel.type === 'camera' || sel.type === 'cave');
   tc.setMode(tcMode === 'scale' && isCam ? 'translate' : tcMode);
   tc.setSpace(tcMode === 'rotate' && isCam ? 'local' : 'world');
   document.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('on', b.dataset.mode === tcMode));
@@ -468,6 +474,8 @@ function focusSelection() {
     if (!box.isEmpty()) target = box.getCenter(new THREE.Vector3());
   } else if (sel && sel.type === 'camera') {
     target = camById(sel.id).obj.position.clone();
+  } else if (sel && sel.type === 'cave') {
+    target = cave.group.position.clone();
   }
   if (!target) target = sceneCenter();
   const off = editorCam.position.clone().sub(orbit.target);
@@ -494,11 +502,13 @@ canvas.addEventListener('pointerup', (e) => {
   const pickables = [];
   for (const c of cams) if (c.id !== pilot) pickables.push(c.gizmo.body, c.gizmo.lens, c.gizmo.label);
   for (const o of objs) pickables.push(o.wrapper);
+  if (cave.cfg.on) pickables.push(...cave.pickables);
   const hit = raycaster.intersectObjects(pickables, true)[0];
   if (!hit) { select(null); return; }
   let n = hit.object;
   while (n) {
     if (n.userData.camId) { select('camera', n.userData.camId); return; }
+    if (n.userData.cave) { select('cave', 'cave'); return; }
     if (n.userData.s3dId) { select('object', n.userData.s3dId); return; }
     n = n.parent;
   }
@@ -512,6 +522,8 @@ const hub = new MasterHub();
 function serialize() {
   return {
     world: { ...worldState },
+    cave: cave.toJSON(),
+    caveK: cave.poseArray(),
     cams: cams.map((c) => ({ id: c.id, screen: c.screen, name: c.name, color: c.color, fov: c.obj.fov, pose: C.camPose(c.obj) })),
     objs: objs.map((o) => ({
       id: o.id, name: o.name, kind: o.kind, url: o.url, main: o.main,
@@ -524,7 +536,9 @@ function posePacket() {
   const c = {}, o = {};
   for (const cam of cams) c[cam.id] = C.camPose(cam.obj);
   for (const it of objs) o[it.id] = C.objPose(it.wrapper, it.action && it.anim !== undefined ? it.action.time : -1);
-  return { t: 'pose', c, o };
+  const pkt = { t: 'pose', c, o };
+  if (cave.cfg.on) pkt.k = cave.poseArray();
+  return pkt;
 }
 
 function sendAssets(v) {
@@ -622,6 +636,8 @@ async function applyScene(s) {
   clearScene();
   worldState = { ...C.DEFAULT_WORLD, ...(s.world || {}) };
   world.apply(worldState);
+  if (s.cave) cave.load(s.cave, s.caveK);
+  refreshCaveInputs();
   for (const c of s.cams || []) addCamera({ id: c.id, screen: c.screen, name: c.name, fov: c.fov, pose: c.pose });
   for (const o of s.objs || []) {
     if (o.kind === 'file') {
@@ -641,6 +657,9 @@ function defaultScene() {
   worldState = { ...C.DEFAULT_WORLD };
   world.apply(worldState);
   addObject({ kind: 'demo', name: 'Demo sculpture' });
+  cave.load({ on: cave.cfg.on }, null);
+  cave.reset();
+  refreshCaveInputs();
   addCamera({ name: 'Front', pose: [0, 1.5, 5.2, 0, 0, 0, 1, 45], lookAt: [0, 0.9, 0] });
   addCamera({ name: 'Left', pose: [-4.6, 2.3, 2.6, 0, 0, 0, 1, 45], lookAt: [0, 0.8, 0] });
   addCamera({ name: 'Right high', pose: [4.0, 3.6, -3.2, 0, 0, 0, 1, 45], lookAt: [0, 0.6, 0] });
@@ -668,7 +687,8 @@ const timer = new THREE.Timer();
 const strip = $('#previews');
 
 function setEditorOnlyVisible(v) {
-  for (const c of cams) c.gizmo.group.visible = v && c.id !== pilot;
+  for (const c of cams) c.gizmo.group.visible = v && c.id !== pilot && !(cave.cfg.on && c.screen <= 3);
+  cave.group.visible = v && cave.cfg.on;
   tcHelper.visible = v && !!tc.object;
   selBox.visible = v && !!sel && sel.type === 'object';
   world.grid.visible = v ? true : !!worldState.grid;
@@ -692,6 +712,7 @@ function loop() {
     }
   }
   for (const o of objs) if (o.mixer && o.anim) o.mixer.update(dt);
+  if (cave.cfg.on) { cave.update(); headTick(); }
   if (sel && sel.type === 'object') { const o = objById(sel.id); if (o) selBox.setFromObject(o.wrapper); }
 
   syncTick();
@@ -741,7 +762,7 @@ function loop() {
     const vx = r.left - cr.left, vy = cr.bottom - r.bottom;
     renderer.setViewport(vx, vy, r.width, r.height);
     renderer.setScissor(l - cr.left, vy, rr - l, r.height);
-    renderer.render(scene, c.obj);
+    renderer.render(scene, cave.cfg.on && c.screen <= 3 ? cave.previewCamera(c.screen - 1) : c.obj);
   }
   setEditorOnlyVisible(true);
   renderer.setScissorTest(false);
@@ -798,7 +819,7 @@ function renderPanel() {
     const on = sel && sel.id === c.id;
     return `<div class="row ${on ? 'sel' : ''}" data-cam="${c.id}">
       <span class="badge" style="--c:${c.color}">${c.screen}</span>
-      <span class="name">${esc(c.name)}</span>
+      <span class="name">${esc(displayName(c))}</span>
       <span class="conn ${n ? 'live' : ''}" title="${n} display${n === 1 ? '' : 's'} showing this camera">${n ? `● ${n}` : '○'}</span>
       <a class="ib" href="${esc(screenUrl(c.screen))}" target="_blank" title="Open screen ${c.screen} in a new tab" data-stop>${ICON.open}</a>
       <button class="ib ${pilot === c.id ? 'on' : ''}" data-pilot="${c.id}" title="Look through this camera">${ICON.eye}</button>
@@ -844,15 +865,31 @@ function syncPreviews(vbs) {
     el.style.setProperty('--c', c.color);
     el.querySelector('.badge').textContent = c.screen;
     el.querySelector('.badge').style.setProperty('--c', c.color);
-    el.querySelector('.pv-name').textContent = c.name;
+    el.querySelector('.pv-name').textContent = displayName(c);
     const n = (vbs.get(c.screen) || []).length;
     el.querySelector('.pv-conn').textContent = n ? `● ${n}` : '';
   }
   strip.hidden = !cams.length;
 }
 
+const CAVE_NAMES = ['CAVE · left', 'CAVE · centre', 'CAVE · right'];
+const displayName = (c) => (cave.cfg.on && c.screen >= 1 && c.screen <= 3 ? CAVE_NAMES[c.screen - 1] : c.name);
+
 function renderProps() {
   const box = $('#props');
+  if (sel && sel.type === 'cave') {
+    box.innerHTML = `
+      <div class="ptitle">CAVE rig</div>
+      <div class="hint">The three screens and your head, placed in the world. Use Move / Rotate at the top of the view, or “Put rig at my view”. World scale is in the CAVE section.</div>
+      <div class="btns"><button class="btn" id="pRigReset">Reset rig</button><button class="btn" id="pRigLevel">Level it</button></div>`;
+    $('#pRigReset').onclick = () => { cave.reset(); cave.setScale(cave.cfg.scale); structural(); };
+    $('#pRigLevel').onclick = () => {
+      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(cave.group.quaternion);
+      cave.group.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.atan2(-fwd.x, -fwd.z));
+      saveDirty = true;
+    };
+    return;
+  }
   if (!sel) { box.innerHTML = '<div class="hint">Click a camera or model (in the view or the lists) to edit it.</div>'; return; }
   if (sel.type === 'camera') {
     const c = camById(sel.id);
@@ -1048,6 +1085,150 @@ async function loadSiteModels() {
       addObject({ kind: 'url', url: m.url, name: m.name || C.baseName(m.url) });
     };
   } catch {}
+}
+
+// ===========================================================================
+//  CAVE panel, head modes, webcam tracking
+// ===========================================================================
+const headCh = 'BroadcastChannel' in window ? new BroadcastChannel(HEAD_CHANNEL(ROOM)) : null;
+let remoteHead = { at: 0, src: '' };
+let trackStatus = '';
+
+function setHead(v) {
+  cave.head.copy(v);
+  if (headCh) headCh.postMessage({ h: [v.x, v.y, v.z], src: 'master' });
+}
+if (headCh) {
+  headCh.onmessage = (e) => {
+    const m = e.data;
+    if (!m || !m.h || m.src === 'master') return;
+    // A screen page is tracking the head: follow it unless we track ourselves.
+    if (cave.headMode === 'webcam' || cave.headMode === 'mouse') return;
+    cave.headMode = 'remote';
+    cave.head.set(m.h[0], m.h[1], m.h[2]);
+    remoteHead = { at: performance.now(), src: m.src };
+  };
+}
+
+const tracker = new HeadTracker(
+  () => cave.cfg,
+  (h) => { if (cave.headMode === 'webcam') setHead(h); },
+  (text) => { trackStatus = text; },
+);
+
+function setHeadMode(mode) {
+  if (cave.headMode === 'webcam' && mode !== 'webcam') tracker.stop();
+  cave.headMode = mode;
+  if (mode === 'fixed') setHead(cave.head.copy(new THREE.Vector3(0, 0, cave.cfg.dist / 100)));
+  if (mode === 'webcam') {
+    trackStatus = 'Starting…';
+    tracker.start($('#cvVideo')).catch(() => { toast(trackStatus || 'Webcam failed', 'error'); setHeadMode('fixed'); refreshCaveInputs(); });
+  }
+  refreshCaveInputs();
+}
+
+let headTextAt = 0;
+function headTick() {
+  const now = performance.now();
+  if (cave.headMode === 'remote' && now - remoteHead.at > 3000) cave.headMode = 'fixed';
+  if (now - headTextAt < 150) return;
+  headTextAt = now;
+  const h = cave.head;
+  const src = { fixed: 'fixed', mouse: 'mouse', webcam: trackStatus || 'webcam', remote: `tracked by ${remoteHead.src}` }[cave.headMode];
+  $('#cvHeadOut').textContent = `head x ${(h.x * 100).toFixed(1)}  y ${(h.y * 100).toFixed(1)}  z ${(h.z * 100).toFixed(1)} cm · ${src}`;
+  const dot = $('.cam-dot');
+  if (cave.headMode === 'webcam' && tracker.face) {
+    dot.hidden = false;
+    dot.style.left = (1 - tracker.face.x) * 100 + '%';
+    dot.style.top = tracker.face.y * 100 + '%';
+  } else dot.hidden = true;
+  if (cave.headMode === 'mouse') {
+    const pd = $('.pad-dot');
+    pd.style.left = (50 + (h.x / 1.0) * 100) + '%';
+    pd.style.top = (50 - (h.y / 0.6) * 100) + '%';
+  }
+}
+
+function refreshCaveInputs() {
+  const c = cave.cfg;
+  $('#cvOn').checked = !!c.on;
+  $('#cvBody').hidden = !c.on;
+  $('#cvIntro').hidden = !!c.on;
+  const sel_ = $('#cvStereo');
+  if (!sel_.options.length) sel_.innerHTML = STEREO_MODES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  sel_.value = c.stereo;
+  $('#cvSwap').checked = !!c.swap;
+  $('#cvDiag').value = c.diag;
+  $('#cvAngle').value = c.angle;
+  $('#cvBezel').value = c.bezel;
+  $('#cvDist').value = c.dist;
+  $('#cvIpd').value = c.ipd;
+  $('#cvAspect').value = `${c.aw}:${c.ah}`;
+  $('#cvScale').value = Math.log10(c.scale);
+  $('#cvScaleOut').textContent = `${c.scale < 1 ? c.scale.toFixed(2) : c.scale.toFixed(1)}×`;
+  $('#cvCamFov').value = c.camFov; $('#cvCamFovOut').textContent = `${c.camFov}°`;
+  $('#cvSmooth').value = c.smooth;
+  $('#cvDepth').value = c.depthMul; $('#cvDepthOut').textContent = `${c.depthMul.toFixed(2)}×`;
+  document.querySelectorAll('[data-hm]').forEach((b) => b.classList.toggle('on', b.dataset.hm === cave.headMode));
+  $('#cvPad').hidden = cave.headMode !== 'mouse';
+  $('#cvCam').hidden = cave.headMode !== 'webcam';
+  const { w, h } = screenSize(c);
+  $('#cvDiag').title = `${(w * 100).toFixed(1)} × ${(h * 100).toFixed(1)} cm visible area`;
+}
+
+function caveChanged(patch) {
+  cave.setCfg(patch);
+  refreshCaveInputs();
+  structural();
+}
+
+$('#cvOn').onchange = (e) => {
+  caveChanged({ on: e.target.checked });
+  if (e.target.checked) {
+    // make sure screens 1–3 exist so their previews show
+    for (const n of [1, 2, 3]) if (!cams.some((c) => c.screen === n)) addCamera({ screen: n });
+    toast('CAVE on: open screens 1, 2, 3 on the left, centre and right monitor (fullscreen).');
+  }
+};
+$('#cvStereo').onchange = (e) => caveChanged({ stereo: e.target.value });
+$('#cvSwap').onchange = (e) => caveChanged({ swap: e.target.checked });
+const num = (id, key, min, max) => {
+  $(id).onchange = (e) => {
+    const v = Math.min(max, Math.max(min, parseFloat(e.target.value)));
+    if (Number.isFinite(v)) caveChanged({ [key]: v }); else refreshCaveInputs();
+  };
+};
+num('#cvDiag', 'diag', 5, 150);
+num('#cvAngle', 'angle', 90, 180);
+num('#cvBezel', 'bezel', 0, 15);
+num('#cvDist', 'dist', 15, 400);
+num('#cvIpd', 'ipd', 40, 80);
+$('#cvAspect').onchange = (e) => { const [aw, ah] = e.target.value.split(':').map(Number); caveChanged({ aw, ah }); };
+$('#cvScale').oninput = (e) => caveChanged({ scale: Math.round(Math.pow(10, +e.target.value) * 100) / 100 });
+$('#cvCamFov').oninput = (e) => caveChanged({ camFov: +e.target.value });
+$('#cvSmooth').oninput = (e) => caveChanged({ smooth: +e.target.value });
+$('#cvDepth').oninput = (e) => caveChanged({ depthMul: +e.target.value });
+$('#cvSelect').onclick = () => select('cave', 'cave');
+$('#cvPlace').onclick = () => { cave.placeAtView(editorCam); saveDirty = true; toast('Rig moved: the centre screen now looks the way you were looking.'); };
+document.querySelectorAll('[data-hm]').forEach((b) => { b.onclick = () => setHeadMode(b.dataset.hm); });
+
+// mouse pad: x ±50 cm, y ±30 cm; scroll = distance
+{
+  const pad = $('#cvPad');
+  const fromEvent = (e) => {
+    const r = pad.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const fy = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    setHead(new THREE.Vector3((fx - 0.5) * 1.0, (0.5 - fy) * 0.6, cave.head.z));
+  };
+  pad.addEventListener('pointerdown', (e) => { pad.setPointerCapture(e.pointerId); fromEvent(e); });
+  pad.addEventListener('pointermove', (e) => { if (pad.hasPointerCapture(e.pointerId)) fromEvent(e); });
+  pad.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const h = cave.head.clone();
+    h.z = Math.min(2.5, Math.max(0.15, h.z + e.deltaY * 0.0006));
+    setHead(h);
+  }, { passive: false });
 }
 
 // ===========================================================================

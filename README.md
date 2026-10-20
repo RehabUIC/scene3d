@@ -69,6 +69,20 @@ If you picked another location, copy the database address shown at the top of th
 
 Imported models are copied to each screen automatically, with a progress bar. They are also kept in the master browser's storage, so a page reload doesn't lose them. Models you import are uploaded to Firebase once (up to 25 MB each) for screens on other networks; each such screen's download counts toward the 10 GB. For large models, put the files in `models/` (see below) and screens download them from GitHub instead.
 
+### CAVE mode (3 monitors, stereo 3D, head-tracked)
+
+Screens 1, 2 and 3 become one wrap-around stereo window. Screen 1 is the left monitor, 2 the centre and 3 the right; the side monitors are turned inward (120° between neighbouring screens by default). Each monitor shows an off-axis view for each eye, so when your head moves, the scene shifts with correct parallax, like looking through a real window ("fish-tank VR").
+
+1. In the master panel, tick **CAVE · 3 monitors → On**.
+2. Set **3D format** (Row-interleaved for passive polarized 3D monitors), **monitor size**, **angle between** screens, **bezel** width and your **eye distance** from the centre screen. Measuring these accurately makes the 3D look right.
+3. Open `…/1`, `…/2`, `…/3` in three browser windows, drag one to each monitor, and press **F** in each for fullscreen. Row-interleaved 3D needs the window fullscreen so its pixel rows line up with the monitor's.
+4. If depth looks inside-out on a screen, press **S** on that screen (or tick **Swap left/right eye** for all).
+5. **The rig:** the three screen outlines and the white ball (your head) in the master's 3D view. Select it (click it or **Select rig**) to move or rotate all three views together, or click **Put rig at my view**. **World scale** shrinks or enlarges the world relative to you.
+
+**Head tracking:** choose **Head → Webcam** in the master (the webcam must sit on top of the centre monitor), or press **T** on one of the screen pages to track from that window. The screen-page option keeps working when the master window is hidden behind the screens, which is usually the case in a 3-monitor setup. Depth is measured from the distance between your pupils, so no calibration is needed; use **Webcam FOV** and **Depth adjust** if distances look off, and **Smoothing** to trade jitter for lag. **Head → Mouse** lets you test parallax by dragging a pad.
+
+The face tracker (MediaPipe) loads from the internet the first time (about 10 MB) and then runs entirely in the browser; no video leaves the computer.
+
 ### Models that live in the repo
 
 For permanent or shared scenes, put model files in `models/` and list them in `models/models.json`:
@@ -116,6 +130,9 @@ js/master.js        editor, cameras, models, sync
 js/viewer.js        screen renderer
 js/link.js          connections (same computer, direct WebRTC, Firebase, relay)
 js/fb.js            Firebase Realtime Database link
+js/cave.js          CAVE geometry, off-axis projection, stereo output
+js/cave-master.js   the CAVE rig in the master's scene
+js/headtrack.js     webcam head tracking (MediaPipe Face Landmarker)
 js/relay.js         optional relay over MQTT servers
 js/common.js        shared scene, loaders, pose format
 js/config.js        settings

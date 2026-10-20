@@ -164,3 +164,24 @@ code { font-family: var(--mono); font-size: 12px; background: var(--bg); padding
 .toast.out { opacity: 0; transform: translateY(6px); }
 @keyframes tin { from { opacity: 0; transform: translateY(8px); } }
 [hidden] { display: none !important; }
+
+/* ---------------- CAVE panel ---------------- */
+.toggle { margin: 0 0 0 auto; text-transform: none; letter-spacing: 0; color: var(--text); font-weight: 400; font-size: 12px; }
+.minor-inline { color: var(--faint); font-size: 11px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 8px 0; }
+.field2 { display: grid; grid-template-columns: 1fr 52px 26px; align-items: center; gap: 4px; font-size: 12px; }
+.field2 > span { color: var(--muted); }
+.field2 em { color: var(--faint); font-style: normal; font-size: 11px; }
+.field2 input, .field2 select { width: 100%; min-width: 0; background: var(--bg); border: 1px solid var(--line-2); border-radius: 6px; padding: 3px 5px; outline: none; }
+.field2 select { grid-column: 2 / 4; }
+.seg-small { display: inline-flex; margin: 6px 0; }
+.seg-small button { padding: 4px 10px; font-size: 12px; }
+.pad { position: relative; height: 96px; margin: 6px 0; border: 1px dashed var(--line-2); border-radius: 8px; background:
+  linear-gradient(var(--line) 1px, transparent 1px) 0 50% / 100% 50%, linear-gradient(90deg, var(--line) 1px, transparent 1px) 50% 0 / 50% 100%, var(--bg);
+  cursor: crosshair; touch-action: none; }
+.pad-dot { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 3px rgba(255,255,255,.2); left: 50%; top: 50%; pointer-events: none; }
+.pad-label { position: absolute; right: 6px; bottom: 4px; font-size: 10px; color: var(--faint); pointer-events: none; }
+.camview { position: relative; margin: 6px 0; border-radius: 8px; overflow: hidden; background: #000; aspect-ratio: 4 / 3; }
+.camview video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+.cam-dot { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px rgba(61,220,151,.3); }
+.dot.error { background: var(--bad); }

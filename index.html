@@ -65,6 +65,41 @@
       <button class="btn wide ghost" id="addCam2">+ Add camera from current view</button>
     </section>
 
+    <section id="caveSec">
+      <h3>CAVE · 3 monitors <label class="check right toggle"><input type="checkbox" id="cvOn"> On</label></h3>
+      <div class="hint" id="cvIntro">Screens 1, 2, 3 become the left, centre and right monitor of a stereo “window” you look through, with head-tracked parallax.</div>
+      <div id="cvBody" hidden>
+        <label class="field"><span>3D format</span><select id="cvStereo"></select></label>
+        <label class="check"><input type="checkbox" id="cvSwap"> Swap left/right eye <span class="minor-inline">(if depth looks inside-out)</span></label>
+        <div class="grid2">
+          <label class="field2"><span>Monitor size</span><input id="cvDiag" type="number" min="10" max="120" step="0.5"><em>inch</em></label>
+          <label class="field2"><span>Angle between</span><input id="cvAngle" type="number" min="90" max="180" step="1"><em>°</em></label>
+          <label class="field2"><span>Bezel</span><input id="cvBezel" type="number" min="0" max="10" step="0.1"><em>cm</em></label>
+          <label class="field2"><span>Eye distance</span><input id="cvDist" type="number" min="20" max="300" step="1"><em>cm</em></label>
+          <label class="field2"><span>Eye separation</span><input id="cvIpd" type="number" min="40" max="80" step="0.5"><em>mm</em></label>
+          <label class="field2"><span>Aspect</span><select id="cvAspect"><option value="16:9">16:9</option><option value="16:10">16:10</option><option value="21:9">21:9</option><option value="4:3">4:3</option></select></label>
+        </div>
+        <label class="field"><span>World scale</span><input id="cvScale" type="range" min="-2" max="2" step="0.01"><output id="cvScaleOut" class="mono"></output></label>
+        <div class="btns">
+          <button class="btn" id="cvSelect">Select rig</button>
+          <button class="btn" id="cvPlace">Put rig at my view</button>
+        </div>
+        <div class="minor">Head</div>
+        <div class="seg seg-small" id="cvHeadMode">
+          <button data-hm="fixed">Fixed</button><button data-hm="mouse">Mouse</button><button data-hm="webcam">Webcam</button>
+        </div>
+        <div id="cvPad" class="pad" hidden title="Drag to move your virtual head; scroll to move closer/further"><span class="pad-dot"></span><span class="pad-label">drag · scroll = distance</span></div>
+        <div id="cvCam" hidden>
+          <div class="camview"><video id="cvVideo" muted playsinline></video><span class="cam-dot" hidden></span></div>
+          <label class="field"><span>Webcam FOV</span><input id="cvCamFov" type="range" min="40" max="100" step="1"><output id="cvCamFovOut" class="mono"></output></label>
+          <label class="field"><span>Smoothing</span><input id="cvSmooth" type="range" min="0" max="1" step="0.05"></label>
+          <label class="field"><span>Depth adjust</span><input id="cvDepth" type="range" min="0.6" max="1.4" step="0.01"><output id="cvDepthOut" class="mono"></output></label>
+        </div>
+        <div class="minor mono" id="cvHeadOut"></div>
+        <div class="minor">Tip: on a screen page press <kbd>T</kbd> to track your head from that window instead, and <kbd>S</kbd> to swap eyes on just that screen.</div>
+      </div>
+    </section>
+
     <section>
       <h3>Selected</h3>
       <div id="props"></div>
@@ -128,6 +163,8 @@
     </div>
     <h3>On a screen page</h3>
     <p>Double-click or press <kbd>F</kbd> for fullscreen. Add <code>?fit=window</code> to fill a non-16:9 display.</p>
+    <h3>CAVE mode</h3>
+    <p>Turn on <b>CAVE · 3 monitors</b>: screens 1, 2, 3 become the left, centre and right monitor of a stereo window with head-tracked parallax. On a screen page, <kbd>T</kbd> starts webcam head tracking from that window and <kbd>S</kbd> swaps the eyes for that screen.</p>
   </div>
 </div>
 

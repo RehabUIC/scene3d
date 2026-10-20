@@ -6,6 +6,9 @@ import * as THREE from 'three';
 import { CONFIG, PARAMS, ROOM } from './config.js';
 import { ViewerLink } from './link.js';
 import * as C from './common.js';
+import { caveCfg, screenCorners, eyes, setOffAxis, makeCaveCamera, rigMatrixFrom, StereoOutput } from './cave.js';
+import { HEAD_CHANNEL } from './cave-master.js';
+import { HeadTracker } from './headtrack.js';
 
 const $ = (s) => document.querySelector(s);
 const SCREEN = Math.max(1, parseInt((window.S3D && window.S3D.screen) || PARAMS.get('screen') || '1', 10) || 1);
@@ -31,6 +34,7 @@ const incoming = new Map(); // id -> { main, files:[{name,size,buf,got}], got, t
 
 function applyState(s) {
   state = s;
+  if (s.caveK && !caveK) caveK = s.caveK;
   world.apply(s.world || {});
 
   const c = (s.cams || []).find((x) => x.screen === SCREEN);
@@ -167,6 +171,7 @@ function playRelay() {
 
 function applyPose(p) {
   playback.count++;
+  if (p.k) caveK = p.k;
   if ((link.mode === 'relay' || link.mode === 'fb') && p.tm != null) { relayPose(p); return; }
   playback.snaps.length = 0;
   if (myCamId && p.c && p.c[myCamId]) {
@@ -276,7 +281,7 @@ function updateOverlay() {
     small = hint || link.status;
   } else if (!state) {
     big = 'Connected'; small = 'Receiving the scene…';
-  } else if (!myCamId) {
+  } else if (!myCamId && !caveActive()) {
     big = `No camera for screen ${SCREEN}`;
     const used = (state.cams || []).map((c) => c.screen).sort((a, b) => a - b);
     small = used.length ? `The master has cameras for screen ${used.join(', ')}. Add one for screen ${SCREEN} there.` : 'Add a camera on the master page.';
@@ -298,6 +303,12 @@ function updateOverlay() {
 
 function hudText() {
   let t = link.status;
+  if (caveActive()) {
+    const cfg = caveCfg(state.cave);
+    t += ` · CAVE ${['left', 'centre', 'right'][SCREEN - 1]} · ${cfg.stereo}${localSwap ? ' (swapped)' : ''}`;
+    if (trackText) t += ` · head: ${trackText}`;
+    else if (localHead.v && performance.now() - localHead.at < 1500) t += ` · head from ${localHead.src}`;
+  }
   if (link.connected) {
     t += ` · ${playback.rate} updates/s`;
     if ((link.mode === 'relay' || link.mode === 'fb')) t += ` · buffer ${Math.round(playback.delay)} ms${link.bcVia ? ' via ' + link.bcVia : ''}`;
@@ -332,7 +343,104 @@ function toggleFullscreen() {
 }
 addEventListener('dblclick', toggleFullscreen);
 $('#fsBtn').onclick = toggleFullscreen;
-addEventListener('keydown', (e) => { if (e.key === 'f' || e.key === 'F') toggleFullscreen(); });
+addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === 'f') toggleFullscreen();
+  else if (k === 't') toggleTracking();
+  else if (k === 's') {
+    localSwap = !localSwap;
+    try { localStorage.setItem(`s3d:swap:${SCREEN}`, localSwap ? '1' : '0'); } catch {}
+    flash(localSwap ? 'Eyes swapped on this screen' : 'Eye order back to normal on this screen');
+  }
+});
+
+// ---------------------------------------------------------------------------
+//  CAVE: screens 1–3 render off-axis stereo views of the shared rig
+// ---------------------------------------------------------------------------
+let caveK = null;              // [rig pos, quat, scale, head] from the master
+const caveCams = { l: makeCaveCamera(), r: makeCaveCamera(), c: makeCaveCamera() };
+const stereo = new StereoOutput(renderer);
+const _rigM = new THREE.Matrix4();
+let localSwap = false;
+try { localSwap = localStorage.getItem(`s3d:swap:${SCREEN}`) === '1'; } catch {}
+function caveActive() { return !!(state && state.cave && state.cave.on && SCREEN >= 1 && SCREEN <= 3); }
+
+// Head position straight from whichever page on this computer is tracking it
+// (lowest latency), otherwise the one the master sends.
+const localHead = { v: null, at: 0, src: '' };
+const headCh = 'BroadcastChannel' in window ? new BroadcastChannel(HEAD_CHANNEL(ROOM)) : null;
+if (headCh) headCh.onmessage = (e) => {
+  const m = e.data;
+  if (m && m.h && m.src !== `screen ${SCREEN}`) { localHead.v = new THREE.Vector3(m.h[0], m.h[1], m.h[2]); localHead.at = performance.now(); localHead.src = m.src; }
+};
+
+// Head tracking from this screen (press T): useful when the master window is
+// hidden behind the screens.
+let tracker = null, trackText = '';
+function toggleTracking() {
+  if (!caveActive()) { flash('Head tracking works when CAVE mode is on in the master.'); return; }
+  if (tracker && tracker.running) { tracker.stop(); tracker = null; trackText = ''; hudText(); return; }
+  tracker = new HeadTracker(
+    () => caveCfg(state && state.cave),
+    (h) => {
+      localHead.v = h; localHead.at = performance.now(); localHead.src = `screen ${SCREEN}`;
+      if (headCh) headCh.postMessage({ h: [h.x, h.y, h.z], src: `screen ${SCREEN}` });
+    },
+    (t) => { trackText = t; },
+  );
+  tracker.start().catch(() => { flash(trackText || 'Could not start the webcam'); tracker = null; });
+}
+
+function caveHead(cfg) {
+  if (localHead.v && performance.now() - localHead.at < 1500) return localHead.v;
+  if (caveK && caveK.length >= 11) return new THREE.Vector3(caveK[8], caveK[9], caveK[10]);
+  return new THREE.Vector3(0, 0, cfg.dist / 100);
+}
+
+// Exact device-pixel size of the canvas (needed for row-interleaved 3D).
+let devSize = null;
+try {
+  new ResizeObserver((entries) => {
+    const e = entries[0];
+    const box = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+    devSize = box ? [box.inlineSize, box.blockSize] : null;
+  }).observe(canvas, { box: 'device-pixel-content-box' });
+} catch {}
+
+let layout = 'normal';
+function useLayout(mode) {
+  if (layout === mode) return;
+  layout = mode;
+  if (mode === 'cave') {
+    Object.assign(canvas.style, { left: '0px', top: '0px', width: '100vw', height: '100vh' });
+    renderer.setPixelRatio(1);
+  } else {
+    canvas.style.width = canvas.style.height = '';
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(1, 1);
+  }
+}
+
+function caveFrame() {
+  useLayout('cave');
+  const dpr = window.devicePixelRatio || 1;
+  const w = devSize ? devSize[0] : Math.round(innerWidth * dpr);
+  const h = devSize ? devSize[1] : Math.round(innerHeight * dpr);
+  const cur = renderer.getDrawingBufferSize(new THREE.Vector2());
+  if (cur.x !== w || cur.y !== h) renderer.setSize(w, h, false);
+
+  const cfg = caveCfg(state.cave);
+  if (localSwap) cfg.swap = !cfg.swap;
+  const k = caveK || state.caveK || [0, 1, 3.2, 0, 0, 0, 1, cfg.scale, 0, 0, cfg.dist / 100];
+  rigMatrixFrom(k, _rigM);
+  const scr = screenCorners(cfg)[SCREEN - 1];
+  const e = eyes(cfg, caveHead(cfg));
+  const near = cfg.near / 100, far = 2000 / Math.max(0.01, k[7]);
+  setOffAxis(caveCams.l, _rigM, scr, e.l, near, far);
+  setOffAxis(caveCams.r, _rigM, scr, e.r, near, far);
+  setOffAxis(caveCams.c, _rigM, scr, e.c, near, far);
+  stereo.render(scene, caveCams.l, caveCams.r, caveCams.c, cfg.stereo, w, h);
+}
 
 // ---------------------------------------------------------------------------
 //  Render loop
@@ -346,6 +454,8 @@ function frame() {
     if (it.mixer && it.anim) it.mixer.update(dt);
   }
   if ((link.mode === 'relay' || link.mode === 'fb')) playRelay();
+  if (caveActive()) { caveFrame(); return; }
+  useLayout('normal');
 
   const W = innerWidth, H = innerHeight;
   let w = W, h = H;
@@ -366,4 +476,4 @@ addEventListener('resize', () => frame());
 updateOverlay();
 pokeHud();
 
-window.scene3dScreen = { items, get state() { return state; }, link, cam };
+window.scene3dScreen = { items, get state() { return state; }, link, cam, caveCams, get caveK() { return caveK; }, caveActive };
